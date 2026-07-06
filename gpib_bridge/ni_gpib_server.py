@@ -605,7 +605,8 @@ def _fmt_peer(peer) -> str:
 # bridge executes without reading the socket -- and sits above the ~20 s lease keepalive (TTL/3).
 _DEFAULT_IDLE_S = 45.0
 _DEFAULT_MAX_CONNS = 128       # cap on concurrent worker threads (backpressure, not refusal)
-_DEFAULT_MAX_CONNS = 128       # cap on concurrent worker threads (backpressure, not refusal)
+_DEFAULT_MAX_FRAME = 65536     # max bytes per request frame; a longer line with NO newline is a DoS
+                               # (unbounded readline grows memory + parks the worker) -> refuse + drop
 
 # Per-pad DEAD-MAN SAFE-STATE (de-key) commands. The bridge is instrument-agnostic, so the byte
 # string sent to safe a pad is CONFIGURED PER GPIB PAD, never hardcoded to one instrument. The
@@ -747,10 +748,17 @@ def serve_connection(conn, backend, token=None, session_id=None, peer=None,
     try:
         while True:
             try:
-                line = f.readline()
-            except (socket.timeout, OSError):          # idle timeout / half-open -> end session
+                line = f.readline(_DEFAULT_MAX_FRAME + 1)   # BOUNDED: a client streaming bytes with no
+            except (socket.timeout, OSError):               # newline cannot grow memory / park the worker
                 break
             if not line:                               # EOF: client closed
+                break
+            if len(line) > _DEFAULT_MAX_FRAME and not line.endswith(b"\n"):
+                try:                                   # over-long frame, no terminator -> refuse + drop
+                    f.write(protocol.encode_reply("!", b"frame too long"))
+                    f.flush()
+                except OSError:
+                    pass
                 break
             verb, payload = protocol.decode_request(line)
             try:

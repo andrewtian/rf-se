@@ -92,3 +92,21 @@ def test_calibration_feeds_measure_wall(tmp_path):
     reloaded = loop.load_calibration(path)
     wall = coord.measure_wall(reloaded, bench=cp.bench)      # loaded cal drives the wall pass
     assert len(wall) == 2 and all("se_db" in r for r in wall.values())
+
+
+def test_measure_wall_rejects_tx_power_mismatch_vs_calibration():
+    # W2.3 substitution guard: SE = reference - wall is valid ONLY if the SAME TX drive fed both
+    # passes. A calibration captured at 12 dBm then a wall pass CONFIGURED at 10 dBm (e.g. cfg edited
+    # between calibrate and measure) must be REJECTED -- not silently offset SE by the 2 dB delta.
+    import config
+    import control_plane
+    # positional BandPlan: (name, f_lo, f_hi, n_points, antenna_gain_dbi, source_power_dbm, danl)
+    cp_cal = control_plane.simulated(config.Campaign(
+        bands=(config.BandPlan("t", 1e9, 2e9, 2, 14.0, 12.0, -150.0, target_se_db=80.0),), label="cal"))
+    ref = cp_cal.make_coordinator().acquire_reference(bench=cp_cal.bench)   # calibration at 12 dBm
+    assert all(r["src_power_dbm"] == 12.0 for r in ref.values())
+    cp_wall = control_plane.simulated(config.Campaign(                     # same freqs, 10 dBm drive
+        bands=(config.BandPlan("t", 1e9, 2e9, 2, 14.0, 10.0, -150.0, target_se_db=80.0),), label="wall"))
+    with pytest.raises(loop.AcquisitionRejected) as ei:
+        cp_wall.make_coordinator().measure_wall(ref, bench=cp_wall.bench)
+    assert "TX power" in str(ei.value)                       # names the mismatch, not an opaque abort

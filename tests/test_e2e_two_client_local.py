@@ -199,3 +199,99 @@ def test_dropped_controller_frees_both_bridges_no_stranding():
     finally:
         nxt_ana.close()
         nxt_src.close()
+
+
+# ----------------------------------------------------------------- two clients race -> ONE controller
+
+def test_two_clients_racing_converge_to_exactly_one_controller():
+    # TWO clients race to lease BOTH bridges (RX then TX -- the coordinator's acquire order) at the
+    # same instant. The bridges' lease arbitration must let EXACTLY ONE win both; the other is refused
+    # on the first contended pad (loses RX -> never reaches TX) -- coherent exclusivity, never split
+    # control across the two hosts. (Raced at the LEASE level: the analyzer health-gate, which
+    # concurrent UNLEASED sweep-liveness probing can trip on the flat fake, is orthogonal to the
+    # arbitration under test and would only confound it.)
+    cp, rx_hp, tx_hp = _two_bridge_cp()
+    results = {}
+    socks = {}
+    start = threading.Barrier(2)
+
+    def race(name):
+        rx = drivers.NetworkTransport(*rx_hp)
+        tx = drivers.NetworkTransport(*tx_hp)
+        socks[name] = (rx, tx)
+        start.wait()                                         # fire both at the same instant
+        try:
+            rx.lease(scope="device", ttl_s=30)               # RX first...
+            tx.lease(scope="device", ttl_s=30)               # ...then TX
+            results[name] = "won"
+        except IOError:
+            results[name] = "lost"                           # refused on the contended pad
+
+    t1 = threading.Thread(target=race, args=("a",))
+    t2 = threading.Thread(target=race, args=("b",))
+    t1.start(); t2.start(); t1.join(5); t2.join(5)
+    try:
+        assert sorted(results) == ["a", "b"]                 # both finished (neither hung)
+        assert list(results.values()).count("won") == 1      # EXACTLY one controller, never two
+        assert list(results.values()).count("lost") == 1     # the other cleanly refused
+    finally:
+        for rx, tx in socks.values():
+            rx.close(); tx.close()
+        cp.resolve(kind="rx").close(); cp.resolve(kind="tx").close()
+
+
+# ----------------------------------------------------------------- host-down: short-TTL rollback
+
+def test_short_ttl_lease_frees_for_next_client_when_holder_goes_silent():
+    # A client leases a bridge with a SHORT ttl then goes SILENT (a dead / partitioned peer: no
+    # keepalive, no release). The lease must EXPIRE so the next client acquires without waiting
+    # forever -- a dead peer cannot lock the instrument past its TTL (host-down rollback).
+    cp, rx_hp, tx_hp = _two_bridge_cp()
+    dead = drivers.NetworkTransport(*tx_hp)
+    dead.lease(scope="device", ttl_s=1.5)                    # short TTL; never renewed (silent)
+    nxt = drivers.NetworkTransport(*tx_hp)
+    try:
+        with pytest.raises(IOError):
+            nxt.lease(scope="device", ttl_s=30)              # still held (well within the 1.5 s TTL)
+        deadline = time.monotonic() + 5.0
+        got = False
+        while time.monotonic() < deadline and not got:
+            try:
+                nxt.lease(scope="device", ttl_s=30); got = True
+            except IOError:
+                time.sleep(0.1)                              # not expired yet -> retry
+        assert got                                           # TTL lapsed -> next client acquired; no lock
+    finally:
+        dead.close(); nxt.close()
+        cp.resolve(kind="rx").close(); cp.resolve(kind="tx").close()
+
+
+# ----------------------------------------------------------------- asymmetric partition frees one side
+
+def test_asymmetric_partition_frees_only_the_partitioned_host():
+    # The coordinator controls BOTH bridges, then ONLY the SOURCE link partitions (its socket drops)
+    # while the ANALYZER link stays up. The source bridge must free its lease (+ dead-man de-key) so a
+    # fresh client takes the source, WHILE the analyzer stays coherently held (still refused to others).
+    # An asymmetric partition frees the affected host without stranding it or dropping the healthy one.
+    cp, rx_hp, tx_hp = _two_bridge_cp()
+    coord = cp.make_coordinator()
+    assert coord.ensure_ready() is True
+    coord.take_control()
+    cp.resolve(kind="tx").close()                            # partition ONLY the source
+    nxt_src = drivers.NetworkTransport(*tx_hp)
+    other_ana = drivers.NetworkTransport(*rx_hp)
+    try:
+        deadline = time.monotonic() + 3.0
+        got_src = False
+        while time.monotonic() < deadline and not got_src:
+            try:
+                nxt_src.lease(scope="device", ttl_s=30); got_src = True
+            except IOError:
+                time.sleep(0.05)
+        assert got_src                                       # partitioned host freed -> reclaimable
+        with pytest.raises(IOError):
+            other_ana.query("ID?")                           # analyzer STILL held -> coherence intact
+    finally:
+        nxt_src.close(); other_ana.close()
+        coord.release_control()
+        cp.resolve(kind="rx").close()                        # tx link already closed above

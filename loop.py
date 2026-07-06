@@ -223,6 +223,16 @@ def measure_wall(cfg, source, analyzer, reference, bench=None, on_point=None):
         if abs(ref_row["f_hz"] - f_hz) > 1.0:            # SE is a ratio: axes MUST match
             raise AcquisitionRejected(
                 f"wall freq {f_hz:.0f} != reference freq {ref_row['f_hz']:.0f} at index {i}")
+        # W2.3 SUBSTITUTION GUARD: SE = reference - wall is valid ONLY if the SAME TX drive fed BOTH
+        # passes -- the source is held constant so it cancels. A calibration LOADED FROM DISK (a
+        # different cfg/session) could carry a different per-point source power; driving this wall
+        # pass at band.source_power_dbm against it would silently offset SE by the power delta. Assert
+        # the reference's recorded drive equals what this wall point will emit.
+        ref_pow = ref_row.get("src_power_dbm")
+        if ref_pow is not None and abs(float(ref_pow) - band.source_power_dbm) > 0.01:
+            raise AcquisitionRejected(
+                f"wall TX power {band.source_power_dbm} dBm != reference TX power {ref_pow} dBm at "
+                f"index {i}: substitution SE requires an identical source drive in both passes")
         # C3: symmetric per-index RBW -- read this point back at whatever RBW the reference
         # pass ended on for THIS index (its adaptive ladder may have narrowed it independently
         # of every other index).

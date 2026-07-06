@@ -334,6 +334,36 @@ def test_idle_timeout_ends_parked_session():
     srv.close()
 
 
+def test_over_long_frame_is_refused_not_parked():
+    # DoS guard (W2.4): a client that streams bytes with NO newline must not grow bridge memory or
+    # park the worker forever. The BOUNDED readline refuses an over-long frame ("! frame too long")
+    # and ends the session.
+    be = ni_gpib_server.FakeBackend()
+    cli, srv = socket.socketpair()
+    cli.settimeout(3.0)
+    th = threading.Thread(target=ni_gpib_server.serve_connection,
+                          args=(srv, be), kwargs={"idle_s": 2.0}, daemon=True)
+    th.start()
+    refused = b""
+    try:
+        try:
+            cli.sendall(b"L" * (ni_gpib_server._DEFAULT_MAX_FRAME + 500))   # over-long, no newline
+        except OSError:
+            pass                                           # server refused + closed mid-send: expected
+        try:
+            refused = cli.recv(256)                        # best-effort: read the refusal reply
+        except OSError:
+            pass
+        th.join(timeout=3.0)
+        assert not th.is_alive()                           # worker ENDED -> not parked, memory bounded
+        if refused:
+            tok, payload = protocol.decode_reply(refused.split(b"\n", 1)[0])
+            assert tok == "!" and b"frame too long" in payload
+    finally:
+        cli.close()
+        srv.close()
+
+
 # =========================================================================== dead-man safe-state (STAGE 1 SAFETY)
 
 def _lease_then_crash(backend, requests, safe_state=None):

@@ -74,21 +74,24 @@ Status key: [x] done + committed, [~] in flight, [ ] queued.
       coordinator.py, cli.py, tests.
 
 ### Wave 2 -- coherence, discovery, correctness, hardening
-- [ ] W2.1 Discovery beacon in the bridge (advertise routable host + pads) + harden discover()
-      (bigger recv buffer, do not abort on first timeout, per-interface broadcast, routable-IP
-      autodetect). Files: gpib_bridge/ni_gpib_server.py, discovery.py, tests.
-- [ ] W2.2 Cross-host lease coherence: monotonic epoch returned on L/K and required on W/Q (reject
-      stale); held() reflects bridge truth (demote on reconnect conflict); bind the two ControlLeases
-      so losing/renew-failing one releases the sibling and aborts; keepalive gated on main-loop
-      liveness; identity (u=) based ownership so a reconnecting client reclaims its lease; a takeover
-      verb or shorter TTL so a dead peer does not block ~120 s. Files: ni_gpib_server.py, control_lease.py,
-      coordinator.py, drivers.py, tests.
-- [ ] W2.3 Substitution TX-identity/level guard: record source *IDN?/serial + per-point src power in
-      the calibration; on the wall pass assert equality (or add src power to settings_key); optional
-      live OL1 readback vs calibration. Files: loop.py, config.py, tests.
-- [ ] W2.4 Bridge DoS/frame hardening: bounded readline, T-verb timeout cap, acquire worker slot
-      before accept / refuse-fast, shorten idle reaping, graceful "! bad frame" (decode inside the
-      per-verb try). Files: ni_gpib_server.py, protocol.py, tests.
+- [~] W2.1 Discovery MECHANISM present: discovery.py Beacon + discover() (encode/decode BeaconInfo),
+      covered in tests/test_networked.py. Wiring a beacon INTO ni_gpib_server (a bridge that advertises)
+      is DEFERRED convenience -- the golden two-VM + shipped path use explicit net:HOST:PORT:PAD
+      addresses (the architecture makes the beacon optional).
+- [~] W2.2 Cross-host lease coherence (RESHAPED for a SINGLE operator, 2026-07-05): DONE -- keepalive
+      gated on main-loop liveness + shorter TTL so a dead peer does not block (both via #47's heartbeat +
+      DEFAULT_LEASE_TTL_S=60s / idle_s=45s); atomic all-or-nothing take_control (#9 W1.4). SKIPPED as
+      YAGNI for one operator: monotonic epoch/fence, held()-demote-on-reconnect, takeover verb, u=-based
+      reclaim. The bridge-side dead-man already prevents a zombie double-drive, so no fence is needed.
+- [x] W2.3 (2026-07-05) Substitution TX-power guard: measure_wall asserts each wall point's TX drive
+      == the calibration's recorded src_power_dbm (a disk-loaded cal at a different power would silently
+      offset SE by the delta). loop.py + tests/test_calibration.py. Source *IDN? identity guard =
+      deferred defense-in-depth (single operator, one source; the power-command mismatch is the realistic
+      corruption path).
+- [~] W2.4 (2026-07-05) Bridge DoS/frame hardening: BOUNDED readline (_DEFAULT_MAX_FRAME=64 KiB ->
+      "! frame too long" + drop, so a no-newline stream can no longer grow memory / park the worker) +
+      removed a duplicate _DEFAULT_MAX_CONNS line; idle reaping already shortened to 45 s (#47).
+      ni_gpib_server.py + tests. Remaining (lower priority): T-verb timeout cap, worker-slot-before-accept.
 
 ### Two-host acceptance tests (the proof of "consistent across machines")
 - [ ] TH.1 Spin up TWO separate bridge processes (analyzer + source) and assert: atomic dual-acquire;
