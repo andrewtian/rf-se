@@ -32,6 +32,7 @@ import queue
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config as cfg_mod
+import coordinator                                     # coordinator.PathNotLive -> distinct NO-COUPLING banner
 
 
 class CampaignAborted(Exception):
@@ -59,6 +60,7 @@ class SEFigureModel:
         self.worst = None                                 # {se_db, lower_bound, band, f_hz, points}
         self.summary = None
         self.error = None
+        self.path_fault = None                            # check_path dict when the RF-path pre-gate fails
 
     # -- feed (called from the GUI timer as it drains the campaign queue) --------
     def set_phase(self, phase):
@@ -87,6 +89,13 @@ class SEFigureModel:
     def set_error(self, exc):
         self.error = str(exc)
         self.phase = "aborted" if isinstance(exc, CampaignAborted) else "error"
+
+    def set_path_fault(self, cp):
+        """The RF-path pre-gate failed (NO-COUPLING): our TX tone never rose above the RX floor, so a
+        campaign would report SE ~= 0 as infinite shielding. Distinct from a generic error -- it names
+        the dead path so the operator checks the source-out cable / antenna feed, not the software."""
+        self.path_fault = dict(cp) if cp else {}
+        self.phase = "path_fault"
 
     def reset(self):
         self.__init__(self.cfg)
@@ -171,6 +180,13 @@ class SEFigureModel:
 
     def worst_text(self):
         """One-line running worst-case SE readout (what the headline shows)."""
+        if self.phase == "path_fault" and self.path_fault is not None:
+            n = self.path_fault.get("n_couple", 0)
+            tot = self.path_fault.get("n", 0)
+            amb = self.path_fault.get("max_ambient_dbm")
+            amb_s = f", max ambient {amb:.1f} dBm" if amb is not None else ""
+            return (f"NO-COUPLING: TX tone never reached RX ({n}/{tot} pts coupled{amb_s}) -- "
+                    "check source-out cable + antenna feed, then run checkpath")
         if self.error and self.phase == "error":
             return f"ERROR: {self.error}"
         if self.phase == "aborted":
@@ -400,6 +416,8 @@ class SELiveGUI:
                                         on_shield_prompt=self._shield_prompt,
                                         pre_check_path=True)
             q.put(("summary", result["summary"]))
+        except coordinator.PathNotLive as e:                # DISTINCT from a generic error: dead RF path
+            q.put(("path_fault", getattr(e, "result", {})))
         except Exception as e:                              # noqa: BLE001 -- surfaced to the GUI
             q.put(("error", e))
 
@@ -424,6 +442,8 @@ class SELiveGUI:
                     self.model.add_wall_point(evt[1], evt[2])
                 elif kind == "summary":
                     self.model.set_summary(evt[1])
+                elif kind == "path_fault":
+                    self.model.set_path_fault(evt[1])
                 elif kind == "error":
                     self.model.set_error(evt[1])
         except queue.Empty:

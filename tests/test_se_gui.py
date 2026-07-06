@@ -14,6 +14,7 @@ Run:  uv run python -m pytest rf-se/se299/tests/test_se_gui.py -q          (need
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 
@@ -24,6 +25,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # headless Qt; set befor
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import config
+import coordinator
 import se_gui
 
 
@@ -177,15 +179,30 @@ def test_model_received_feed_back_compat_when_rows_lack_levels():
 class _FakeCoord:
     """A scripted coordinator: fires the reference + wall callbacks with canned rows, exactly as
     loop/coordinator would, so the GUI feed path is exercised without hardware."""
-    def __init__(self, ref_rows, wall_rows, campaign_pass=True, call_shield=False):
+    def __init__(self, ref_rows, wall_rows, campaign_pass=True, call_shield=False, path_fault=None):
         self.ref_rows, self.wall_rows, self._pass = ref_rows, wall_rows, campaign_pass
         self._call_shield = call_shield               # fire on_shield_prompt between ref and wall
+        self._path_fault = path_fault                 # dict -> run_campaign raises PathNotLive(cp)
+        self._depth = 0                               # controlled() re-entrancy mirror
 
     def ensure_ready(self):
         return True
 
+    @contextlib.contextmanager
+    def controlled(self):                             # no-op re-entrant CM mirroring Coordinator
+        self._depth += 1
+        try:
+            yield
+        finally:
+            self._depth -= 1
+
+    def check_path(self, freqs_hz, bench=None, guard_db=6.0):
+        return self._path_fault or {"verdict": "PATH-LIVE", "n_couple": 3, "n": 3}
+
     def run_campaign(self, bench=None, on_se_update=None, on_reference_point=None,
                      on_shield_prompt=None, pre_check_path=False, check_path_guard_db=6.0):
+        if pre_check_path and self._path_fault is not None:      # dead RF path -> the pre-gate blocks
+            raise coordinator.PathNotLive(self._path_fault)
         for i, row in enumerate(self.ref_rows):
             if on_reference_point:
                 on_reference_point(i, row)
@@ -226,6 +243,26 @@ def test_gui_feed_path_paints_curve_and_drains():
     assert [round(float(y), 6) for y in ys] == [102.0, 95.0]
     assert "95.0 dB" in gui.headline.text() and "GHz" in gui.headline.text()
     assert gui.progress_txt.text().startswith("phase=done")
+
+
+def test_no_coupling_pre_gate_surfaces_distinct_fault_banner():
+    # G.1: the mandatory RF-path pre-gate. A dead path (TX tone never rises above the RX floor) must
+    # abort with a DISTINCT NO-COUPLING banner that names the dead path -- NOT a generic ERROR (which
+    # reads as a software bug). Proves PathNotLive is caught separately and rendered in the headline.
+    pytest.importorskip("PySide6")
+    model = _model()
+    cp = {"verdict": "NO-COUPLING", "n_couple": 0, "n": 3, "max_ambient_dbm": -88.0}
+    factory = lambda gain, rbw, *a: (
+        _FakeCoord([_ref_row(1e9)], [_wall_row(1e9)], path_fault=cp), None)
+    gui = se_gui.SELiveGUI(model, factory)
+    gui._run_campaign()                                  # synchronous: the pre-gate raises PathNotLive
+    gui._drain()                                         # main-thread drain -> set_path_fault
+    assert model.phase == "path_fault"
+    txt = model.worst_text()
+    assert "NO-COUPLING" in txt and "0/3" in txt         # names the dead path + coupled/total points
+    assert not txt.startswith("ERROR")                   # distinct from the generic error branch
+    gui.render()                                         # refresh the view from the model
+    assert "NO-COUPLING" in gui.headline.text()          # surfaced in the headline label
 
 
 def test_gui_render_paints_received_feed_tx_line_and_peak():

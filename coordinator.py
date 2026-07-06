@@ -16,6 +16,7 @@ analyzer/source pair -- not just the 8565EC/68369A -- is driven unchanged.
 """
 from __future__ import annotations
 
+import contextlib
 import time
 
 import control_lease
@@ -132,6 +133,7 @@ class Coordinator:
         # high-band preselector-peak point, plus the pre_check_path probe -- so a healthy slow point
         # never false-stalls; ~90-120 s is a sound floor.
         self.heartbeat_timeout_s = heartbeat_timeout_s
+        self._control_depth = 0            # re-entrancy for controlled(): lease on 0->1, release on 1->0
         self._last_beat = None
         hb = (lambda: self._last_beat) if heartbeat_timeout_s else None
         # ONE ControlLease per link is the single home of lease + keepalive + release (Phase 3):
@@ -244,6 +246,25 @@ class Coordinator:
         self._rx_lease.release()
         self._tx_lease.release()
 
+    @contextlib.contextmanager
+    def controlled(self):
+        """Hold exclusive control for a block, RE-ENTRANTLY. The OUTERMOST enter leases both
+        instruments (take_control); the OUTERMOST exit releases them (release_control, which does the
+        guaranteed RF-off backstop FIRST). A nested `with self.controlled():` inside an already-held
+        block does NOT re-lease and does NOT early-release -- so a pre-gate that holds control and then
+        calls a primitive which also wants control keeps ONE lease, and the RF-off backstop fires
+        exactly once, on the outer exit. This is the single home of the take/release discipline that
+        walkaround / sweep / run_campaign share."""
+        if self._control_depth == 0:
+            self.take_control()
+        self._control_depth += 1
+        try:
+            yield
+        finally:
+            self._control_depth -= 1
+            if self._control_depth == 0:
+                self.release_control()
+
     # -- measurement primitives (streaming) -------------------------------------
     def check_path(self, freqs_hz, bench=None, guard_db=6.0):
         """RF-path go/no-go self-test over the pair (see loop.check_path)."""
@@ -266,13 +287,10 @@ class Coordinator:
         overrides the band default), analyzer reads the probe in a loop until should_stop() (see
         loop.nearfield_walkaround). Holds exclusive control for the duration; releases (and RF-off)
         even if a read raises."""
-        self.take_control()
-        try:
+        with self.controlled():
             return loop.nearfield_walkaround(self.cfg, self.source, self.analyzer, freq_hz,
                                              on_frame, should_stop, bench=bench,
                                              use_average=use_average, power_dbm=power_dbm)
-        finally:
-            self.release_control()
 
     def sweep(self, freqs_hz=None, wall=False, bench=None):
         """INSTANCE-1-DRIVES a source-tracked sweep across the pair: the analyzer is read at each
@@ -282,13 +300,10 @@ class Coordinator:
         follows. freqs_hz defaults to the FULL cfg plan (e.g. DC_TO_40GHZ_BANDS -> 10 MHz..40 GHz).
         Holds exclusive control for the sweep; the source is left OFF. Returns loop.stepped_cw_sweep's
         result (freqs_hz, levels_dbm, hot bin, source_tracked=True)."""
-        self.take_control()
-        try:
+        with self.controlled():
             freqs = [f for f, _ in self.cfg.frequencies()] if freqs_hz is None else list(freqs_hz)
             return loop.stepped_cw_sweep(self.cfg, self.source, self.analyzer, freqs,
                                          bench=bench, wall=wall)
-        finally:
-            self.release_control()
 
     def acquire_reference(self, bench=None, on_point=None):
         self._require_ready()
@@ -348,8 +363,7 @@ class Coordinator:
                 if not h["healthy"]:
                     raise AnalyzerWedged(h["ref_codes"], h["sweeping"])
 
-        self.take_control()
-        try:
+        with self.controlled():
             if pre_check_path:
                 # PRE-GATE: prove the TX tone actually reaches the RX before spending a full campaign.
                 # A dead path (loose source-out / disconnected feed) otherwise reads SE ~= 0 as if the
@@ -373,7 +387,5 @@ class Coordinator:
                 finally:
                     self.beat()                               # resume liveness for the wall pass
             wall = self.measure_wall(reference, bench=bench, on_point=wall_point)
-        finally:
-            self.release_control()
         return {"summary": loop.summarize(reference, wall),
                 "reference": reference, "wall": wall, "se_figure": fig.figure()}

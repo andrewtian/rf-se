@@ -168,3 +168,32 @@ def test_passing_campaign_also_fires_shield_prompt_between_passes():
     # the SE VALUE assertion still holds with the shield hook wired in
     worst = min(result["wall"].values(), key=lambda r: r["se_reported_db"])
     assert worst["se_reported_db"] >= 55.0 - 1e-6      # >= the lowered target everywhere
+
+
+def test_controlled_context_is_reentrant_single_lease_single_release():
+    # G.1: controlled() is the single home of the take/release discipline. Nesting must lease ONCE (on
+    # the outer enter) and release ONCE (on the outer exit), so a pre-gate that holds control and then
+    # calls a primitive which also wants control keeps ONE lease and the RF-off backstop fires once.
+    _, cp = _passing_campaign()
+    coord = cp.make_coordinator()
+    calls = {"take": 0, "rel": 0}
+    coord.take_control = lambda: calls.__setitem__("take", calls["take"] + 1)
+    coord.release_control = lambda: calls.__setitem__("rel", calls["rel"] + 1)
+    with coord.controlled():
+        with coord.controlled():                          # nested: no re-lease, no early release
+            assert calls["take"] == 1 and calls["rel"] == 0
+    assert calls == {"take": 1, "rel": 1}
+
+
+def test_controlled_context_releases_even_when_body_raises():
+    # the guaranteed RF-off backstop (release_control) must run on the outer exit even if the body
+    # raises -- a raising pre-gate/campaign never leaves the source keyed past control release.
+    _, cp = _passing_campaign()
+    coord = cp.make_coordinator()
+    calls = {"take": 0, "rel": 0}
+    coord.take_control = lambda: calls.__setitem__("take", calls["take"] + 1)
+    coord.release_control = lambda: calls.__setitem__("rel", calls["rel"] + 1)
+    with pytest.raises(ValueError):
+        with coord.controlled():
+            raise ValueError("boom")
+    assert calls == {"take": 1, "rel": 1}                 # released exactly once despite the raise
