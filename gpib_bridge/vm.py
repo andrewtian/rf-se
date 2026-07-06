@@ -19,6 +19,7 @@ testable; the actual boot + firmware upload + USB grab are the real-environment 
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import plistlib
@@ -599,23 +600,55 @@ def _write(path, text):
         fh.write(text)
 
 
+def _base_cache_name(spec: VmSpec) -> str:
+    """The shared-cache filename for this spec's cloud image, keyed by the image basename so a
+    different image URL never reuses a stale cached base."""
+    stem = os.path.basename(spec.image_location).rsplit(".", 1)[0] or "cloudimg"
+    return f"{stem}.qcow2"
+
+
+def _find_existing_base(vm_root: str) -> str:
+    """Any already-downloaded per-instance disk-base.qcow2 under vm_root, to seed the shared cache
+    from (a hardlink) instead of re-downloading. Returns '' if none exists."""
+    for p in sorted(glob.glob(os.path.join(vm_root, "*", "disk-base.qcow2"))):
+        if os.path.exists(p):
+            return p
+    return ""
+
+
 def prepare_assets(spec: VmSpec, workdir: str = None, run=None,
                    reset: bool = False) -> AssetPaths:
     """Download + prep the VM assets (idempotent). Returns AssetPaths. run is the subprocess
     runner (injectable for tests); the cloud-init files are always written so a test can
     assert their content without shelling out.
 
-    The pristine cloud image is downloaded + resized ONCE into disk-base.qcow2 and NEVER
-    booted; the VM boots a disposable copy-on-write overlay (disk.qcow2) on top. reset=True
-    (or a missing overlay) recreates the overlay + seed, so provisioning re-runs from a clean
-    slate WITHOUT a re-download -- the fix for a boot whose provisioning failed part-way."""
+    The pristine cloud image is downloaded + resized ONCE into a SHARED, machine-level cache
+    (~/.se299-vm/_base/<image>.qcow2) and NEVER booted; every instance's disposable copy-on-write
+    overlay (disk.qcow2) backs onto that one base, so a new instance/role never re-downloads the
+    ~600 MB image. The shared cache is seeded by hardlink from any pre-existing per-instance
+    disk-base.qcow2 (no re-download on machines provisioned before this cache existed); an existing
+    per-instance base is still honored so overlays created before the change keep a valid backing
+    chain. reset=True (or a missing overlay) recreates the overlay + seed WITHOUT a re-download."""
     run = run or _run
     wd = workdir or spec.workdir()
     os.makedirs(wd, exist_ok=True)
-    base = os.path.join(wd, "disk-base.qcow2")
-    if not os.path.exists(base):
-        run(download_argv(spec.image_location, base))
-        run(resize_argv(base))
+    vm_root = os.path.dirname(wd)                              # ~/.se299-vm (tmp parent in tests)
+    legacy_base = os.path.join(wd, "disk-base.qcow2")         # pre-shared-cache per-instance base
+    shared_base = os.path.join(vm_root, "_base", _base_cache_name(spec))
+    if not os.path.exists(shared_base):
+        os.makedirs(os.path.dirname(shared_base), exist_ok=True)
+        donor = legacy_base if os.path.exists(legacy_base) else _find_existing_base(vm_root)
+        if donor and os.path.exists(donor):                   # reuse an already-downloaded base
+            try:
+                os.link(donor, shared_base)                   # read-only base -> safe to share one inode
+            except OSError:
+                shutil.copyfile(donor, shared_base)           # cross-filesystem fallback
+        else:
+            run(download_argv(spec.image_location, shared_base))
+            run(resize_argv(shared_base))
+    # honor an existing per-instance base (keeps a pre-existing overlay's backing chain valid);
+    # otherwise back the overlay onto the shared cache.
+    base = legacy_base if os.path.exists(legacy_base) else shared_base
     image = os.path.join(wd, "disk.qcow2")
     if reset and os.path.exists(image):
         os.remove(image)

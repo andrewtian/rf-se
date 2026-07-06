@@ -652,11 +652,12 @@ def test_asset_argv_builders():
 
 
 def test_prepare_assets_writes_cloudinit_and_calls_tools(tmp_path):
+    wd = tmp_path / "inst"                                # unique workdir -> per-test shared-cache root
     calls = []
-    assets = vm.prepare_assets(vm.VmSpec(), workdir=str(tmp_path),
+    assets = vm.prepare_assets(vm.VmSpec(), workdir=str(wd),
                                run=lambda a: calls.append(a[0]))
-    assert "provision.sh" in (tmp_path / "cidata" / "user-data").read_text()
-    assert (tmp_path / "cidata" / "meta-data").exists()
+    assert "provision.sh" in (wd / "cidata" / "user-data").read_text()
+    assert (wd / "cidata" / "meta-data").exists()
     # base download (curl + qemu-img resize), the overlay (qemu-img create), and the seed
     assert "curl" in calls and "qemu-img" in calls and "hdiutil" in calls
     assert assets.image.endswith("disk.qcow2") and assets.seed.endswith("seed.iso")
@@ -664,25 +665,57 @@ def test_prepare_assets_writes_cloudinit_and_calls_tools(tmp_path):
 
 def test_prepare_assets_is_idempotent(tmp_path):
     # base + overlay + seed all present -> nothing is re-downloaded or re-made
-    (tmp_path / "disk-base.qcow2").write_text("base")
-    (tmp_path / "disk.qcow2").write_text("overlay")
-    (tmp_path / "seed.iso").write_text("x")
+    wd = tmp_path / "inst"
+    wd.mkdir()
+    (wd / "disk-base.qcow2").write_text("base")
+    (wd / "disk.qcow2").write_text("overlay")
+    (wd / "seed.iso").write_text("x")
     calls = []
-    vm.prepare_assets(vm.VmSpec(), workdir=str(tmp_path), run=lambda a: calls.append(a[0]))
+    vm.prepare_assets(vm.VmSpec(), workdir=str(wd), run=lambda a: calls.append(a[0]))
     assert calls == []                                   # nothing re-downloaded / re-made
 
 
 def test_prepare_assets_reset_recreates_overlay_without_redownloading_base(tmp_path):
     # the failed-provision recovery: reset rebuilds the overlay + seed but KEEPS the base
-    (tmp_path / "disk-base.qcow2").write_text("base")
-    (tmp_path / "disk.qcow2").write_text("stale-overlay")
-    (tmp_path / "seed.iso").write_text("stale")
+    wd = tmp_path / "inst"
+    wd.mkdir()
+    (wd / "disk-base.qcow2").write_text("base")
+    (wd / "disk.qcow2").write_text("stale-overlay")
+    (wd / "seed.iso").write_text("stale")
     calls = []
-    vm.prepare_assets(vm.VmSpec(), workdir=str(tmp_path),
+    vm.prepare_assets(vm.VmSpec(), workdir=str(wd),
                       run=lambda a: calls.append(a[0]), reset=True)
     assert "curl" not in calls                           # base NOT re-downloaded
     assert "qemu-img" in calls and "hdiutil" in calls    # overlay + seed rebuilt
-    assert not (tmp_path / "disk.qcow2").exists()         # stale overlay removed (stub won't recreate)
+    assert not (wd / "disk.qcow2").exists()               # stale overlay removed (stub won't recreate)
+
+
+def test_prepare_assets_shares_base_cache_across_instances(tmp_path):
+    # the ~600 MB image is downloaded ONCE to a shared cache; a second instance reuses it (no re-download)
+    downloads = {"n": 0}
+
+    def run(a):
+        if a[0] == "curl":                               # download_argv: [curl,-L,--fail,-o,dest,url]
+            downloads["n"] += 1
+            open(a[4], "w").close()                      # materialize the base so the 2nd call sees it
+
+    vm.prepare_assets(vm.VmSpec(name="rx"), workdir=str(tmp_path / "rx"), run=run)
+    vm.prepare_assets(vm.VmSpec(name="tx"), workdir=str(tmp_path / "tx"), run=run)
+    assert downloads["n"] == 1                            # downloaded once, shared by both instances
+    assert (tmp_path / "_base").is_dir()                  # shared cache lives beside the instances
+
+
+def test_prepare_assets_seeds_shared_cache_from_existing_base_without_download(tmp_path):
+    # a machine provisioned BEFORE the shared cache existed: seed it from the old per-instance base
+    # (hardlink) instead of re-downloading.
+    old = tmp_path / "se299-rx"
+    old.mkdir()
+    (old / "disk-base.qcow2").write_text("already-downloaded-base")
+    calls = []
+    vm.prepare_assets(vm.VmSpec(name="tx"), workdir=str(tmp_path / "se299-tx"),
+                      run=lambda a: calls.append(a[0]))
+    assert "curl" not in calls                            # reused the existing base -> no download
+    assert (tmp_path / "_base" / "ubuntu-24.04-server-cloudimg-arm64.qcow2").exists()
 
 
 # ----------------------------------------------------------------- ensure_bridge (NO fake)
