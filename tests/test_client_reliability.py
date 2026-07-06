@@ -270,6 +270,34 @@ def test_soft_recover_is_not_reentrant():
     assert link.state == conn.FAULT                  # inner fault + failed recovery -> terminal
 
 
+def test_probe_alive_true_when_open_answers_no_side_effects():
+    # the side-effect-free liveness probe the recovery loop uses: True when open answers, and it must NOT
+    # touch the FAULT accounting or state (unlike connect(), which the probe must never trip toward FAULT).
+    dev = _dev()
+    link = conn.SourceLink(conn.DEFAULT_68369A, (1e9, 6e9),
+                           discover_fn=lambda: [dev], open_fn=lambda d: object(), fault_after=3)
+    assert link.probe_alive() is True
+    assert link._consec_fail == 0 and link.state == conn.DISCONNECTED
+
+
+def test_probe_alive_false_when_open_fails_no_side_effects():
+    dev = _dev()
+
+    def open_fails(d):
+        raise IOError("ENOL")
+
+    link = conn.SourceLink(conn.DEFAULT_68369A, (1e9, 6e9),
+                           discover_fn=lambda: [dev], open_fn=open_fails, fault_after=3)
+    assert link.probe_alive() is False
+    assert link._consec_fail == 0 and link.state == conn.DISCONNECTED   # a probe never faults the link
+
+
+def test_probe_alive_false_when_absent():
+    link = conn.SourceLink(conn.DEFAULT_68369A, (1e9, 6e9),
+                           discover_fn=lambda: [], open_fn=lambda d: object(), fault_after=3)
+    assert link.probe_alive() is False
+
+
 def test_absent_device_is_not_a_fault():
     # ABSENT (nothing on the bus) must stay ABSENT, never escalate to FAULT -- distinct condition.
     link = conn.SourceLink(expected=conn.DEFAULT_68369A, span=(1e9, 6e9),

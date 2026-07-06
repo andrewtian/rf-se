@@ -1099,6 +1099,7 @@ def cmd_se_gui(args):
         print(vmmod.launch_plan(vmmod.VmSpec(port=args.vm_port, source_port=args.vm_source_port)))
         return 0
     analyzer_addr, source_addr = args.analyzer, args.source
+    vm_spec = None                                       # LOCAL --vm only -> the owner wires 44.2 recovery
     if getattr(args, "vm", False):
         from gpib_bridge import vm as vmmod
         try:
@@ -1106,10 +1107,12 @@ def cmd_se_gui(args):
         except vmmod.BridgeUnavailable as e:
             print(f"qemu bridge unavailable: {e}")
             return 1
+        vm_spec = vmmod.VmSpec(port=args.vm_port, source_port=args.vm_source_port)
     model, gui = se_gui.build_se_gui(analyzer_addr, source_addr,
                                      gain_dbi=args.gain, rbw_hz=args.rbw,
                                      client_id=drivers.client_id(role="se-gui"),
-                                     out_dir=(getattr(args, "out_dir", "") or None))
+                                     out_dir=(getattr(args, "out_dir", "") or None),
+                                     vm_spec=vm_spec)
     # seed the operator sweep-band + tone controls from the CLI (also settable in the GUI window)
     if getattr(args, "span_lo", None) is not None and getattr(args, "span_hi", None) is not None:
         gui.seed_span(args.span_lo, args.span_hi)

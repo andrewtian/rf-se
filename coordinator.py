@@ -121,7 +121,7 @@ class Coordinator:
     the pair, with auto-reconnect readiness, exclusive control, and a live SE figure."""
 
     def __init__(self, cfg, rx_link, tx_link, lease_ttl_s: float = control_lease.DEFAULT_LEASE_TTL_S,
-                 heartbeat_timeout_s=None):
+                 heartbeat_timeout_s=None, vm_spec=None):
         self.cfg = cfg
         self.rx = rx_link
         self.tx = tx_link
@@ -142,6 +142,12 @@ class Coordinator:
                                                     heartbeat=hb, heartbeat_timeout_s=heartbeat_timeout_s)
         self._tx_lease = control_lease.ControlLease(self.tx, ttl_s=lease_ttl_s,
                                                     heartbeat=hb, heartbeat_timeout_s=heartbeat_timeout_s)
+        # 44.2: a LOCAL --vm owner wires soft recovery (de-key + QMP virtual-replug) into each link's
+        # FAULT threshold. None (a remote net: owner or sim) leaves recover_fn None -> HARD-alert only,
+        # since the in-guest bridge cannot reach the host QMP socket.
+        self._vm_spec = vm_spec
+        if vm_spec is not None:
+            self._wire_soft_recovery(vm_spec)
 
     # -- abstract RX/TX handles (loop.py drives the DRIVER objects) --------------
     @property
@@ -264,6 +270,37 @@ class Coordinator:
             self._control_depth -= 1
             if self._control_depth == 0:
                 self.release_control()
+
+    # -- 44.2 supervised soft recovery (local --vm owner) -----------------------
+    def _dekey_source_best_effort(self):
+        """De-key the source, tolerating a down link -- if the SOURCE's own adapter is the wedged one the
+        write may not land, and the bridge dead-man (task #47) is then the real backstop. Mirrors
+        release_control's guaranteed RF-off-first."""
+        try:
+            src = self.source
+            if src is not None:
+                src.rf_off()
+        except Exception:                                 # noqa: BLE001 -- best-effort
+            pass
+
+    def _wire_soft_recovery(self, vm_spec, budget: int = 2):
+        """Wire each link's recover_fn so a would-be terminal FAULT first attempts a supervised soft
+        recovery: de-key the source, then QMP virtual-replug THIS adapter up to `budget` and revalidate
+        via the link's side-effect-free probe. RX = the B adapter ('analyzer'); TX = the HS adapter
+        ('source'). vm is imported LAZILY so the sim/test path never loads the qemu bridge module. The
+        source de-key runs before EITHER adapter's replug -- the source never radiates across a
+        re-enumeration."""
+        from gpib_bridge import vm as vmmod
+        import recovery
+        for link, which in ((self.rx, "analyzer"), (self.tx, "source")):
+            def _recover(exc, spec=vm_spec, which=which, link=link):
+                out = recovery.soft_recover(
+                    dekey_fn=self._dekey_source_best_effort,
+                    replug_fn=lambda: vmmod.attach_adapter(spec, which),
+                    reachable_fn=link.probe_alive,
+                    budget=budget)
+                return out.recovered
+            link._recover_fn = _recover
 
     # -- measurement primitives (streaming) -------------------------------------
     def check_path(self, freqs_hz, bench=None, guard_db=6.0):

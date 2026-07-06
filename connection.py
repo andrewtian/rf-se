@@ -167,6 +167,25 @@ class AnalyzerLink:
         self._consec_fail = 0                         # a probed READY IS a successful bus op -> reset
         return self.status()
 
+    def probe_alive(self) -> bool:
+        """SIDE-EFFECT-FREE liveness probe: attempt discover -> match -> open (the control plane's open
+        is liveness-wrapped, so a successful open proves the instrument ANSWERS) and return whether it
+        answered -- WITHOUT mutating the FAULT accounting or link state. Used by the 44.2 soft-recover
+        loop to test whether a QMP virtual-replug brought the adapter back, so the probe itself can never
+        push the link toward FAULT (which link.connect() would)."""
+        try:
+            devices = self._discover() or []
+        except Exception:                             # noqa: BLE001 -- a probe never raises
+            return False
+        match = next((d for d in devices
+                      if self.expected.model_token.lower() in (d.model or "").lower()), None)
+        if match is None:
+            return False
+        try:
+            return self._open(match) is not None
+        except Exception:                             # noqa: BLE001 -- not answering yet
+            return False
+
     def ensure(self) -> bool:
         """Guarantee READY if possible. Idempotent: returns immediately when already READY;
         otherwise retries connect() up to `retries` times. A terminal FAULT is NOT auto-cleared

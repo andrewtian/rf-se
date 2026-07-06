@@ -16,6 +16,57 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import recovery
 
+import config
+import control_plane
+import coordinator
+from gpib_bridge import vm as vmmod
+
+
+def _sim_pair():
+    cfg = config.Campaign(
+        bands=(config.BandPlan("t", 1e9, 2e9, 2, 14.0, 12.0, -150.0, target_se_db=55.0),), label="rec")
+    cp = control_plane.simulated(cfg)
+    return cfg, cp.resolve(kind="rx"), cp.resolve(kind="tx")
+
+
+# ---- 44.2 production wiring: a LOCAL --vm owner wires recover_fn; a remote/sim owner does not -------
+
+def test_coordinator_without_vm_spec_leaves_recover_fn_none():
+    cfg, rx, tx = _sim_pair()
+    coordinator.Coordinator(cfg, rx, tx)                     # no vm_spec = remote/sim owner
+    assert rx._recover_fn is None and tx._recover_fn is None
+
+
+def test_coordinator_with_vm_spec_wires_recover_fn_on_both_links():
+    cfg, rx, tx = _sim_pair()
+    coordinator.Coordinator(cfg, rx, tx, vm_spec=object())   # a LOCAL --vm owner
+    assert callable(rx._recover_fn) and callable(tx._recover_fn)
+
+
+def test_recover_fn_qmp_replugs_the_right_role_and_returns_probe(monkeypatch):
+    cfg, rx, tx = _sim_pair()
+    coordinator.Coordinator(cfg, rx, tx, vm_spec=object())
+    attaches = []
+    monkeypatch.setattr(vmmod, "attach_adapter", lambda spec, which, **k: attaches.append(which) or True)
+    tx.probe_alive = lambda: True                            # replug made the source answer
+    rx.probe_alive = lambda: True
+    assert tx._recover_fn(IOError("wedge")) is True
+    assert attaches == ["source"]                            # TX -> the HS adapter
+    attaches.clear()
+    assert rx._recover_fn(IOError("wedge")) is True
+    assert attaches == ["analyzer"]                          # RX -> the B adapter
+
+
+def test_from_addresses_forwards_vm_spec_to_the_coordinator(monkeypatch):
+    cfg = config.Campaign(
+        bands=(config.BandPlan("t", 1e9, 2e9, 2, 14.0, 12.0, -150.0, target_se_db=55.0),), label="rec")
+    sentinel = object()
+    cp = control_plane.from_addresses(cfg, rx_addr="net:h:1:18", tx_addr="net:h:1:5", vm_spec=sentinel)
+    assert cp.vm_spec is sentinel
+    monkeypatch.setattr(vmmod, "attach_adapter", lambda spec, which, **k: True)
+    coord = cp.make_coordinator()                            # forwards vm_spec -> links get recover_fn
+    assert callable(coord.rx._recover_fn) and callable(coord.tx._recover_fn)
+
 
 def test_soft_recover_dekeys_before_any_replug():
     order = []

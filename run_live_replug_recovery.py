@@ -21,11 +21,13 @@ the LIVE adapter via vm.attach_adapter -- reporting SOFT-recovered vs HARD (-> r
 Exit: 0 = SOFT-recovered live; 1 = HARD (not cleared by QMP -- physical/VBUS remedy); 2 = bring-up
 error; 3 = blocked (adapters share one controller -- move one, then re-run).
 
-NOTE: production auto-recovery (wiring recover_fn into control_plane for a local --vm owner by threading
-the VmSpec down from cli._ensure_vm_addresses) is the ONE remaining integration step; it is deliberately
-done + validated HERE on the bench, because its correctness (right spec/role/de-key) can only be
-confirmed with the real qemu + adapter present. This script drives recovery.soft_recover directly so the
-engine itself is proven on real hardware first.
+NOTE: production auto-recovery is NOW WIRED (2026-07-06) -- a LOCAL `se-gui --vm` owner threads the
+VmSpec through control_plane into each link's recover_fn, so a mid-session wedge auto-recovers without
+this script. This gate serves two purposes: (1) prove the recovery ENGINE on a real replug by driving
+recovery.soft_recover directly (below), and (2) as the place to VALIDATE the wired se-gui path live --
+run `uv run python rf-se/se299/cli.py se-gui --vm`, wedge/replug an adapter, and confirm the owner
+auto-recovers (reconnects increments). The wiring's correctness (right spec/role/de-key) can only be
+CONFIRMED with the real qemu + adapter present.
 """
 import argparse
 import os

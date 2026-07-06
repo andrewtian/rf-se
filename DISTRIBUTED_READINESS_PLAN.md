@@ -190,12 +190,20 @@ Status key: [x] done + committed, [~] in flight, [ ] queued.
     * 44.3 recovery.recover_power -- HONEST deferred VBUS seam: never claims success (no uhubctl
       per-port-power hub procured); the HARD alert names the physical-replug remedy. The link stays
       terminal FAULT on a failed recovery.
-  BENCH-GATED (needs the physical adapter -- run_live_replug_recovery.py, 44.4):
-    * the ONE remaining production integration: thread the local VmSpec from cli._ensure_vm_addresses
-      down through control_plane into the owner's recover_fn (a LOCAL --vm owner only). Deliberately
-      done + validated on the bench, because right-spec/role/de-key can only be confirmed with the real
-      qemu + adapter present.
+  PRODUCTION WIRING NOW STAGED (2026-07-06, fake-tested): the local VmSpec threads
+    cli.cmd_se_gui (--vm) -> se_gui.build_se_gui(vm_spec) -> control_plane.from_addresses(vm_spec) ->
+    ControlPlane.vm_spec -> make_coordinator -> Coordinator(vm_spec) -> _wire_soft_recovery, which sets
+    each link's recover_fn (RX='analyzer'/B, TX='source'/HS) to soft_recover(de-key source, QMP
+    attach_adapter, link.probe_alive, budget). vm_spec is built ONLY on a LOCAL --vm bring-up; a plain
+    net: address stays None (HARD-alert only). connection.probe_alive is a side-effect-free liveness
+    probe so the recovery loop never trips the FAULT accounting. (test_recovery wiring + probe_alive
+    tests; full board green.)
+  BENCH-GATED remainder (needs the physical adapter -- run_live_replug_recovery.py, 44.4):
+    * VALIDATE the wired path live: run se-gui --vm, wedge/replug an adapter, confirm the owner
+      auto-recovers mid-session (reconnects increments). Right-spec/role/de-key can only be CONFIRMED
+      with the real qemu + adapter present, though the wiring is now in place.
     * the definitive SOFT-vs-HARD proof: a CLEAN replug SOFT-recovers via QMP; a load-induced FX2 -110
       wedge does NOT and must land in the HARD alert -- only a physical unplug/replug tells them apart.
       A fake QMP backend cannot reproduce real FX2 re-enumeration. Requires both NI adapters on SEPARATE
-      USB controllers (a bring-up on a SHARED controller wedges both).
+      USB controllers (a bring-up on a SHARED controller wedges both), and the 68369A powered + cabled
+      at pad 5 (the standing ENOL blocker).

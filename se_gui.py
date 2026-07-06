@@ -568,7 +568,7 @@ def build_cfg(gain_dbi=33, rbw_hz=1000.0, use_opc=False,
 
 
 def build_se_gui(analyzer_addr="sim", source_addr="sim", gain_dbi=33, rbw_hz=1000.0,
-                 telemetry_port=0, client_id=None, out_dir=None):
+                 telemetry_port=0, client_id=None, out_dir=None, vm_spec=None):
     """Build (SEFigureModel, SELiveGUI) wired to run a real campaign over the given addresses.
     'sim'/'sim' -> the simulator control plane; otherwise net:/VISA addresses via from_addresses.
     Returns the model + GUI; call gui.run() for the interactive window. `client_id` (if given) is
@@ -581,7 +581,7 @@ def build_se_gui(analyzer_addr="sim", source_addr="sim", gain_dbi=33, rbw_hz=100
             cp = control_plane.simulated(cfg)
         else:
             cp = control_plane.from_addresses(cfg, rx_addr=analyzer_addr, tx_addr=source_addr,
-                                              client_id=client_id)
+                                              client_id=client_id, vm_spec=vm_spec)
         return cp.make_coordinator(), getattr(cp, "bench", None)
 
     model = SEFigureModel(build_cfg(gain_dbi, rbw_hz))

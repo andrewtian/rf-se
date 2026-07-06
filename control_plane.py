@@ -177,6 +177,8 @@ class ControlPlane:
         self.span = tuple(span)
         self.units = []
         self.bench = None                     # set by simulated(); None for real hardware
+        self.vm_spec = None                   # a LOCAL --vm bring-up sets this -> the coordinator wires
+        #                                       44.2 soft recovery; None (remote net:/sim) = HARD-alert only
 
     def add_unit(self, unit):
         self.units.append(unit)
@@ -216,7 +218,7 @@ class ControlPlane:
             raise ControlPlaneError(
                 f"a coordinator needs one rx and one tx; have "
                 f"{len(self.available_rx())} rx / {len(self.available_tx())} tx")
-        return coordinator.Coordinator(self.cfg, rx, tx, lease_ttl_s=lease_ttl_s)
+        return coordinator.Coordinator(self.cfg, rx, tx, lease_ttl_s=lease_ttl_s, vm_spec=self.vm_spec)
 
 
 # ----------------------------------------------------------------- builders
@@ -250,13 +252,14 @@ def from_beacons(cfg, beacons, span=(1e9, 6e9), token=None, client_id=None):
     return cp
 
 
-def from_addresses(cfg, rx_addr=None, tx_addr=None, span=(1e9, 6e9), client_id=None):
+def from_addresses(cfg, rx_addr=None, tx_addr=None, span=(1e9, 6e9), client_id=None, vm_spec=None):
     """A ControlPlane from EXPLICIT instrument addresses (net:HOST:PORT:PAD or a VISA
     string), one per role, when no discovery beacon is running. The model is assumed to be
     the role's seeded default (8565EC rx / 68369A tx) -- the user asserts what the address
     points at. make_transport routes net: -> NetworkTransport, else -> VISA. `client_id` (if
     given) is announced to a network bridge so its session registry attributes the session."""
     cp = ControlPlane(cfg, span)
+    cp.vm_spec = vm_spec                       # LOCAL --vm bring-up -> the coordinator wires soft recovery
     for kind, addr in (("rx", rx_addr), ("tx", tx_addr)):
         if not addr:
             continue
