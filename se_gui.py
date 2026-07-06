@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config as cfg_mod
 import coordinator                                     # coordinator.PathNotLive -> distinct NO-COUPLING banner
+import loop                                            # write_run / write_calibration (G.2 persistence)
 
 
 class CampaignAborted(Exception):
@@ -61,6 +62,8 @@ class SEFigureModel:
         self.summary = None
         self.error = None
         self.path_fault = None                            # check_path dict when the RF-path pre-gate fails
+        self.persisted_path = None                        # run dir a completed campaign was saved to
+        self.persist_error = None                         # non-fatal: a persistence write failed
 
     # -- feed (called from the GUI timer as it drains the campaign queue) --------
     def set_phase(self, phase):
@@ -212,9 +215,11 @@ class SELiveGUI:
     (only _tick touches widgets, so the worker never crosses into Qt). The class holds a QMainWindow
     (self.window); Qt is imported LAZILY so importing this module needs no Qt (the model stays pure)."""
 
-    def __init__(self, model, campaign_factory, title="se299 live SE figure (IEEE-299 substitution)"):
+    def __init__(self, model, campaign_factory, title="se299 live SE figure (IEEE-299 substitution)",
+                 out_dir=None):
         self.model = model
         self.campaign_factory = campaign_factory          # (gain,rbw,span_lo,span_hi,power) -> (coord, bench)
+        self._out_dir = out_dir                           # None -> auto output/<label>-<timestamp> on a run
         self._q = queue.Queue()
         self._stop = threading.Event()
         self._shield_ok = threading.Event()               # operator "shield inserted, continue" gate
@@ -416,10 +421,32 @@ class SELiveGUI:
                                         on_shield_prompt=self._shield_prompt,
                                         pre_check_path=True)
             q.put(("summary", result["summary"]))
+            self._persist(coord, result)                    # save the completed run (best-effort)
         except coordinator.PathNotLive as e:                # DISTINCT from a generic error: dead RF path
             q.put(("path_fault", getattr(e, "result", {})))
         except Exception as e:                              # noqa: BLE001 -- surfaced to the GUI
             q.put(("error", e))
+
+    def _persist(self, coord, result):
+        """Persist a COMPLETED campaign (reference/wall/summary + a reloadable calibration) under the
+        run dir -- worker-thread I/O, so it runs off the Qt main thread. BEST-EFFORT: a write failure
+        emits a non-fatal ('persist_error', msg) and never crashes or blanks the campaign. SKIPS
+        write_calibration on an empty reference (calibration_summary indexes rows[0]); only a completed
+        run reaches here (an abort/PathNotLive raises before the summary put)."""
+        reference = result.get("reference") or {}
+        if not reference:                                   # empty (e.g. a test fake) -> nothing to save
+            return
+        try:
+            import datetime
+            ts = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+            base = self._out_dir or os.path.join("output", f"{coord.cfg.label}-{ts}")
+            loop.write_run(base, coord.cfg, reference, result.get("wall") or {},
+                           result.get("summary") or {}, timestamp=ts, note="se-gui campaign")
+            loop.write_calibration(os.path.join(base, "calibration.json"), coord.cfg, reference,
+                                   loop.calibration_summary(reference), timestamp=ts)
+            self._q.put(("persisted", base))
+        except Exception as e:                              # noqa: BLE001 -- persistence is best-effort
+            self._q.put(("persist_error", str(e)))
 
     # -- main-thread drain + redraw ----------------------------------------------
     def _drain(self):
@@ -444,6 +471,10 @@ class SELiveGUI:
                     self.model.set_summary(evt[1])
                 elif kind == "path_fault":
                     self.model.set_path_fault(evt[1])
+                elif kind == "persisted":
+                    self.model.persisted_path = evt[1]      # run saved -> operator status
+                elif kind == "persist_error":
+                    self.model.persist_error = evt[1]       # non-fatal save failure -> status
                 elif kind == "error":
                     self.model.set_error(evt[1])
         except queue.Empty:
@@ -537,7 +568,7 @@ def build_cfg(gain_dbi=33, rbw_hz=1000.0, use_opc=False,
 
 
 def build_se_gui(analyzer_addr="sim", source_addr="sim", gain_dbi=33, rbw_hz=1000.0,
-                 telemetry_port=0, client_id=None):
+                 telemetry_port=0, client_id=None, out_dir=None):
     """Build (SEFigureModel, SELiveGUI) wired to run a real campaign over the given addresses.
     'sim'/'sim' -> the simulator control plane; otherwise net:/VISA addresses via from_addresses.
     Returns the model + GUI; call gui.run() for the interactive window. `client_id` (if given) is
@@ -554,5 +585,5 @@ def build_se_gui(analyzer_addr="sim", source_addr="sim", gain_dbi=33, rbw_hz=100
         return cp.make_coordinator(), getattr(cp, "bench", None)
 
     model = SEFigureModel(build_cfg(gain_dbi, rbw_hz))
-    gui = SELiveGUI(model, factory)
+    gui = SELiveGUI(model, factory, out_dir=out_dir)
     return model, gui

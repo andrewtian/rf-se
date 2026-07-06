@@ -1108,7 +1108,8 @@ def cmd_se_gui(args):
             return 1
     model, gui = se_gui.build_se_gui(analyzer_addr, source_addr,
                                      gain_dbi=args.gain, rbw_hz=args.rbw,
-                                     client_id=drivers.client_id(role="se-gui"))
+                                     client_id=drivers.client_id(role="se-gui"),
+                                     out_dir=(getattr(args, "out_dir", "") or None))
     # seed the operator sweep-band + tone controls from the CLI (also settable in the GUI window)
     if getattr(args, "span_lo", None) is not None and getattr(args, "span_hi", None) is not None:
         gui.seed_span(args.span_lo, args.span_hi)
@@ -1490,6 +1491,9 @@ def main(argv=None):
     spg.add_argument("--gain", type=int, choices=(25, 33), default=33,
                      help="top-band horn gain dBi (33=elite no-LNA, 25=standard+LNA)")
     spg.add_argument("--rbw", type=float, default=1000.0, help="analyzer RBW (Hz)")
+    spg.add_argument("--out-dir", dest="out_dir", default="",
+                     help="save the completed campaign (manifest/reference/wall/CSV + calibration) here; "
+                          "default output/<label>-<timestamp>")
     spg.add_argument("--span-lo", dest="span_lo", type=float, default=None,
                      help="operator sweep-band start (GHz); with --span-hi replaces the 1-40 GHz plan")
     spg.add_argument("--span-hi", dest="span_hi", type=float, default=None, help="sweep-band stop (GHz)")

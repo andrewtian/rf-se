@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import config
 import coordinator
+import loop
 import se_gui
 
 
@@ -263,6 +264,41 @@ def test_no_coupling_pre_gate_surfaces_distinct_fault_banner():
     assert not txt.startswith("ERROR")                   # distinct from the generic error branch
     gui.render()                                         # refresh the view from the model
     assert "NO-COUPLING" in gui.headline.text()          # surfaced in the headline label
+
+
+def test_se_gui_persists_completed_campaign(tmp_path):
+    # G.2: a COMPLETED campaign auto-saves the full state (manifest/reference/wall/CSV) + a reloadable
+    # calibration; today se-gui kept only the in-memory summary and discarded the rest.
+    pytest.importorskip("PySide6")
+    import control_plane
+    cfg = config.Campaign(
+        bands=(config.BandPlan("t", 1e9, 2e9, 2, 14.0, 12.0, -150.0, target_se_db=55.0),), label="g2")
+    cp = control_plane.simulated(cfg)
+    coord = cp.make_coordinator()
+    ref = coord.acquire_reference(bench=cp.bench)         # real loop-shaped rows (not a fake)
+    wall = coord.measure_wall(ref, bench=cp.bench)
+    result = {"reference": ref, "wall": wall, "summary": loop.summarize(ref, wall)}
+    model = se_gui.SEFigureModel(cfg)
+    gui = se_gui.SELiveGUI(model, lambda *a: (coord, cp.bench), out_dir=str(tmp_path))
+    gui._persist(coord, result)                           # worker-thread persistence path
+    gui._drain()
+    for name in ("manifest.json", "reference.json", "wall.json", "se_results.csv", "calibration.json"):
+        assert (tmp_path / name).exists(), name
+    reloaded = loop.load_calibration(str(tmp_path / "calibration.json"))
+    assert len(reloaded) == len(cfg.frequencies())        # the reference dict round-trips
+    assert model.persisted_path == str(tmp_path)
+
+
+def test_se_gui_does_not_persist_empty_reference(tmp_path):
+    # an aborted / empty run (reference={}) must write NOTHING -- calibration_summary indexes rows[0],
+    # so persisting an empty reference would crash; _persist skips it entirely.
+    pytest.importorskip("PySide6")
+    model = _model()
+    gui = se_gui.SELiveGUI(model, lambda *a: (None, None), out_dir=str(tmp_path))
+    gui._persist(_FakeCoord([], []), {"reference": {}, "wall": {}, "summary": {}})
+    gui._drain()
+    assert list(tmp_path.iterdir()) == []                 # empty reference -> nothing written
+    assert model.persisted_path is None
 
 
 def test_gui_render_paints_received_feed_tx_line_and_peak():
