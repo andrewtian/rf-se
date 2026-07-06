@@ -23,6 +23,86 @@ ADAPTER_WEDGED = "adapter-wedged"
 LEASED = "leased"
 BOARD_BUSY = "board-busy"
 
+# ---- #44 recovery tiers (auto-recover on unplug/replug): the reshaped wedge-vs-not-wedged decision.
+# The bring-up path computes these signals but does not centralize the verdict; classify_recovery() is
+# the single pure home so 44.2 (soft QMP-replug) and 44.3 (hard alert) act off ONE decision, not
+# scattered booleans. Ordering encodes the R6 false-positive fix: SETTLING / PRE_FIRMWARE / BOOTING_GRACE
+# are all "keep waiting, do NOT declare a wedge"; only present + boards-online + past-grace + silent is a
+# real wedge, and only past the QMP-replug budget is it HARD.
+SETTLING = "settling"                 # present but the adapter identity has not stabilized yet
+PRE_FIRMWARE = "pre-firmware"         # B adapter present but its FX2 firmware is not loaded yet
+BOOTING_GRACE = "booting-grace"       # guest GPIB boards not enumerated yet -- still booting (guards R6)
+ANSWERING = "answering"               # the instrument responded -- no recovery needed
+INSTRUMENT_SILENT = "instrument-silent"   # present + boards online + past grace, yet silent: a real wedge
+
+
+@dataclass(frozen=True)
+class RecoveryVerdict:
+    label: str                # which instrument (e.g. "8565EC analyzer (RX)")
+    tier: str                 # one of the recovery-tier constants above (or BRIDGE_DOWN)
+    soft_recoverable: bool    # True -> a QMP virtual-replug is worth trying (44.2); False -> wait or HARD
+    shared_controller: bool   # orthogonal warning: the two adapters share ONE USB controller (double -110)
+    action: str               # one-line operator/daemon remedy
+
+    def __str__(self) -> str:
+        warn = "\n  ! shared USB controller: a double wedge needs one adapter moved to another controller" \
+            if self.shared_controller else ""
+        return f"{self.label}: {self.tier.upper()}\n  -> {self.action}{warn}"
+
+
+def classify_recovery(label: str, *, host_present: bool, host_settled: bool, boards_online: bool,
+                      instrument_answering: bool, grace_elapsed: bool, qmp_attempts_spent: bool,
+                      is_b_role: bool = False, fxloaded: bool = True,
+                      shared_controller: bool = False) -> RecoveryVerdict:
+    """Pure decision table for auto-recovery: given the signals the bring-up path already computes, return
+    the recovery tier + whether a QMP virtual-replug is worth trying (soft_recoverable). NO I/O -- the
+    caller supplies the probed booleans (44.2/44.3), so this is 100% hardware-free testable.
+
+    Ordering (each clause assumes the ones above it are False):
+      not host_present            -> BRIDGE_DOWN     (the adapter/VM is not up on the host)
+      not host_settled            -> SETTLING        (identity not stable yet -- keep waiting)
+      B role and not fxloaded      -> PRE_FIRMWARE    (FX2 firmware still loading -- keep waiting)
+      not boards_online            -> BOOTING_GRACE   (guest boards not enumerated -- keep waiting; guards
+                                                       the R6 false positive EVEN past the attempt budget)
+      instrument_answering         -> ANSWERING       (it came back -- no recovery needed)
+      not grace_elapsed            -> SETTLING        (silent but still within the settle grace -- wait)
+      not qmp_attempts_spent       -> INSTRUMENT_SILENT, soft_recoverable=True  (try a QMP virtual-replug)
+      else                         -> INSTRUMENT_SILENT, soft_recoverable=False (HARD: physical replug)
+    `shared_controller` rides on any verdict as an orthogonal warning."""
+    def verdict(tier: str, soft: bool, action: str) -> RecoveryVerdict:
+        return RecoveryVerdict(label, tier, soft, bool(shared_controller), action)
+
+    if not host_present:
+        return verdict(BRIDGE_DOWN, False,
+            f"the {label} adapter/VM is not present on the host -- (re)start the bring-up (--vm) or check "
+            "the host/port.")
+    if not host_settled:
+        return verdict(SETTLING, False,
+            f"the {label} adapter is present but its identity has not settled -- keep waiting (do NOT "
+            "declare a wedge).")
+    if is_b_role and not fxloaded:
+        return verdict(PRE_FIRMWARE, False,
+            f"the {label} adapter is present but its FX2 firmware is not loaded yet -- keep waiting for "
+            "fxload (do NOT declare a wedge).")
+    if not boards_online:
+        return verdict(BOOTING_GRACE, False,
+            f"the {label} guest GPIB boards are not enumerated yet -- still booting; keep waiting (do NOT "
+            "declare a wedge, even past the attempt budget).")
+    if instrument_answering:
+        return verdict(ANSWERING, False, f"the {label} instrument is answering -- no recovery needed.")
+    if not grace_elapsed:
+        return verdict(SETTLING, False,
+            f"the {label} boards are up but the instrument has not answered yet -- within the settle "
+            "grace; keep waiting.")
+    if not qmp_attempts_spent:
+        return verdict(INSTRUMENT_SILENT, True,
+            f"the {label} boards are up but the instrument is silent past the grace -- try a QMP "
+            "virtual-replug (SOFT recover), then revalidate.")
+    return verdict(INSTRUMENT_SILENT, False,
+        f"the {label} instrument is still silent after the QMP virtual-replug budget -- HARD wedge: "
+        "physically unplug and replug the adapter (VBUS removal) or power-cycle the instrument, then "
+        "re-run bring-up. A QMP/USB reset does NOT clear an FX2 -110 firmware wedge.")
+
 
 @dataclass(frozen=True)
 class AcquireDiagnosis:

@@ -119,3 +119,56 @@ def test_lease_exclusive_conflict_carries_classified_attribution():
         assert "LEASED" in ei.value.report and "session 7" in ei.value.report and "u=other" in ei.value.report
     finally:
         srv.close()
+
+
+# ---- classify_recovery (#44 pure recovery-tier decision table) -------------------------------
+
+def _rv(**over):
+    kw = dict(host_present=True, host_settled=True, boards_online=True, instrument_answering=True,
+              grace_elapsed=True, qmp_attempts_spent=False, is_b_role=False, fxloaded=True,
+              shared_controller=False)
+    kw.update(over)
+    return ld.classify_recovery("RX", **kw)
+
+
+def test_classify_recovery_decision_table():
+    cases = [
+        # (overrides, expected_tier, expected_soft_recoverable)
+        (dict(host_present=False), ld.BRIDGE_DOWN, False),
+        (dict(host_settled=False), ld.SETTLING, False),
+        (dict(is_b_role=True, fxloaded=False), ld.PRE_FIRMWARE, False),
+        (dict(boards_online=False, instrument_answering=False), ld.BOOTING_GRACE, False),
+        # R6 guard: boards not enumerated -> NOT a wedge EVEN past the attempt budget
+        (dict(boards_online=False, instrument_answering=False, qmp_attempts_spent=True),
+         ld.BOOTING_GRACE, False),
+        (dict(instrument_answering=True), ld.ANSWERING, False),
+        (dict(instrument_answering=False, grace_elapsed=False), ld.SETTLING, False),
+        (dict(instrument_answering=False, grace_elapsed=True, qmp_attempts_spent=False),
+         ld.INSTRUMENT_SILENT, True),
+        (dict(instrument_answering=False, grace_elapsed=True, qmp_attempts_spent=True),
+         ld.INSTRUMENT_SILENT, False),
+    ]
+    for over, tier, soft in cases:
+        v = _rv(**over)
+        assert v.tier == tier, (over, v.tier)
+        assert v.soft_recoverable is soft, (over, v.soft_recoverable)
+
+
+def test_classify_recovery_boot_grace_guards_r6_false_positive():
+    # the reshaped R6 fix: boards not enumerated yet must NOT declare a wedge, even after the QMP budget.
+    v = _rv(boards_online=False, instrument_answering=False, grace_elapsed=True, qmp_attempts_spent=True)
+    assert v.tier == ld.BOOTING_GRACE and v.soft_recoverable is False
+
+
+def test_classify_recovery_soft_then_hard_on_budget_exhaustion():
+    soft = _rv(instrument_answering=False, grace_elapsed=True, qmp_attempts_spent=False)
+    hard = _rv(instrument_answering=False, grace_elapsed=True, qmp_attempts_spent=True)
+    assert soft.tier == ld.INSTRUMENT_SILENT and soft.soft_recoverable is True     # try QMP replug
+    assert hard.tier == ld.INSTRUMENT_SILENT and hard.soft_recoverable is False    # HARD: physical replug
+    assert "QMP" in soft.action and "physically" in hard.action.lower()
+
+
+def test_classify_recovery_shared_controller_rides_and_renders():
+    v = _rv(instrument_answering=False, grace_elapsed=True, qmp_attempts_spent=True, shared_controller=True)
+    assert v.shared_controller is True
+    assert "shared USB controller" in str(v)                # the orthogonal warning rides the verdict
