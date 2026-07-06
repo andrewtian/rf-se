@@ -1,0 +1,37 @@
+[project]
+name = "rf-se"
+version = "0.1.0"
+description = "se299 RF shielded-enclosure bench: HP/Agilent 8565EC analyzer + Anritsu 683xx source over a networked GPIB bridge for IEEE-299 substitution shielding-effectiveness measurement"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.4",
+    "matplotlib>=3.10",
+    "pytest>=8.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest-xdist>=3.8.0",
+]
+# Live PySide6 / pyqtgraph bench GUI (bench_gui, se_gui, sa/sg GUIs, Point-Op).
+se299-gui = [
+    "pyqtgraph>=0.14.0",
+    "pyside6>=6.11.1",
+    "pytest-qt>=4.5.0",
+]
+# Optional VISA backend for driving REAL instruments over GPIB directly. se299 runs
+# hardware-free on the simulator and reaches networked instruments through
+# drivers.NetworkTransport (the qemu/Pi bridge) with NO VISA at all, so this stays optional.
+se299-hw = [
+    "pyvisa>=1.14",
+    "pyvisa-py>=0.7",
+]
+# Optional statistical-detection backend (Leahy power spectra + coherence). The pipeline
+# runs on a numpy fallback that computes the same statistic, so this is not required.
+rf-se = [
+    "stingray>=2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [".*", "build", "dist", "node_modules", ".venv", "*.egg"]

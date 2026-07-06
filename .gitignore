@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# se299 generated bench outputs (measurements are written at runtime)
+output/
+measurements/
+
+# OS
+.DS_Store
