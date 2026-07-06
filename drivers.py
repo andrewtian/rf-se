@@ -1825,7 +1825,10 @@ class SimSpectrumAnalyzer(SpectrumAnalyzer):
         self.aunits = units
 
     def set_detector(self, mode: str) -> None:
-        self.detector = mode
+        # G.3: normalize like the real driver (Agilent856xEC.set_detector) + sim.configure(), so a
+        # human label ('peak'/'sample') reaches the SAME mnemonic the floor-bump keys off at the POS
+        # branch below -- else a raw 'peak' != 'POS' silently loses the +2.5 dB positive-peak bump.
+        self.detector = normalize_detector(mode)
 
     def set_video_average(self, count=None) -> None:
         self.video_avg = int(count or 0)

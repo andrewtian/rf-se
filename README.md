@@ -58,8 +58,17 @@ CLI verbs take addresses directly (`--analyzer net:HOST:PORT:PAD --source net:..
 ```bash
 uv sync
 uv run python rf-se/se299/cli.py demo                       # SE sweep end-to-end on the simulator
-QT_QPA_PLATFORM=offscreen uv run --group se299-gui python -m pytest rf-se/se299/tests/ -q  # full board
+QT_QPA_PLATFORM=offscreen uv run --group se299-gui python -m pytest tests/ -q  # full board
 ```
+
+The full board is the single command above. `tests/conftest.py` drains Qt objects (DeferredDelete +
+closeAllWindows + gc) after every test so the co-located Qt + non-Qt suite does not trip an
+intermittent shiboken teardown SIGSEGV at interpreter finalization; it is a pure no-op for tests that
+never load Qt (so the board still collects and runs WITHOUT the `se299-gui` group). If that segfault
+ever recurs on a machine, fall back to the SPLIT board (both green): run the non-Qt files first
+(`--ignore=` the Qt files: test_se_gui / test_bench / test_cli_gui_verbs / test_live / test_point_op_* /
+test_range_mode / test_sa_panel / test_sg_panel / test_walkaround / test_agent), then those Qt files on
+their own.
 
 ## Quick start (hardware-free -- runs today, no pyvisa, no instruments)
 

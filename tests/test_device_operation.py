@@ -424,10 +424,35 @@ def test_sim_measure_tracked_peak_delegates_to_zero_span():
 def test_set_detector_normalizes_human_labels():
     # AUDIT F1: set_detector() must normalize like configure() -- a raw "DET sample" is SILENTLY
     # IGNORED by the 8565EC (stale detector -> wrong number). A human label -> the valid mnemonic.
-    for label, mnem in [("sample", "SMP"), ("peak", "POS"), ("neg-peak", "NEG"), ("normal", "NRM")]:
+    for label, mnem in [("sample", "SMP"), ("peak", "POS"), ("neg-peak", "NEG"), ("normal", "NRM"),
+                        ("garbage", "POS")]:               # unknown -> POS (safe positive-peak default)
         t = FakeT()
         drivers.Agilent856xEC(t).set_detector(label)
-        assert t.writes == [f"DET {mnem}"]                 # normalized, not the raw label
+        assert t.writes == [f"DET {mnem}"]                 # normalized, not the raw label; never a raw DET
+
+
+def test_sim_set_detector_normalizes_human_labels():
+    # G.3: SimSpectrumAnalyzer.set_detector must normalize a human label to the mnemonic (parity with
+    # Agilent856xEC.set_detector + sim.configure), else a raw 'peak' != 'POS' silently loses the
+    # _subst_base positive-peak floor bump keyed on detector == "POS".
+    an = drivers.SimSpectrumAnalyzer(drivers.SimBench(separation_m=0.6))
+    for label, mnem in [("peak", "POS"), ("sample", "SMP"), ("neg-peak", "NEG"), ("garbage", "POS")]:
+        an.set_detector(label)
+        assert an.detector == mnem                         # normalized, not the raw label
+
+
+def test_sim_set_detector_pos_bump_parity_in_subst_base():
+    # the +2.5 dB positive-peak floor bump (_subst_base swept path) must follow a HUMAN 'peak' label
+    # now that set_detector normalizes -> 'POS'; a raw 'peak' would have silently lost it.
+    bench = drivers.SimBench(separation_m=0.6)
+    bench.src_rf_on = False                                # floor branch of _subst_base
+    an = drivers.SimSpectrumAnalyzer(bench)
+    an.configure(1e3, 3e3, -10.0, "sample")               # valid RBW + SMP detector
+    smp = an._subst_base(2e9, bench)
+    an.set_detector("peak")                                # human label -> POS via the G.3 fix
+    pos = an._subst_base(2e9, bench)
+    assert an.detector == "POS"
+    assert pos == pytest.approx(smp + 2.5)                # POS floor sits +2.5 dB above SMP
 
 
 def test_configure_pins_amplitude_units_to_dbm():
