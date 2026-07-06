@@ -1026,6 +1026,12 @@ class Agilent856xEC(SpectrumAnalyzer):  # pragma: no cover - requires hardware
     # the calibration and read ASCII, so binary can never ship a wrong amplitude.
     _BIN_CAL_MAX_RMS_DB = 0.5
 
+    # G.4b: max |analytical-map - ASCII| (dB) to TRUST the analytical (RL/LG log-law) fallback when the
+    # empirical fit has NO SPREAD (a narrow-span strong tone: every MU equal -> _fit_linear returns None)
+    # or is loose. Far tighter than one display division (LG dB, default 10): a wrong/stale RL or scale is
+    # off by >= a division and fails this gate, so binary still never ships a wrong amplitude.
+    _BIN_CAL_ANALYTIC_MAX_DB = 2.0
+
     # how many (dwell + paired binary read) attempts to confirm the SNGLS hold is FROZEN before the
     # calibration's paired read. Two agreeing binary reads = settled; a still-sweeping trace never agrees,
     # so retry. If it never settles the calibration is skipped (ASCII fallback), never wrong.
@@ -1350,6 +1356,34 @@ class Agilent856xEC(SpectrumAnalyzer):  # pragma: no cover - requires hardware
         levels = [a * m + b for m in mu]
         return (self._freq_axis(len(levels)), levels)
 
+    def _analytical_bin_cal(self):
+        """G.4b: the 8560/8565 log-display law maps the FIXED 601-pt trace (MU 0..600) linearly to dBm
+        across 10 divisions -- the top line = the reference level RL, each division = LG dB. So
+        dBm = RL - (600 - MU) * (LG / 60), i.e. (a, b) = (LG/60, RL - 10*LG). At the 10 dB/div default
+        this is a = 1/6, b = RL - 100 (the LIVE-documented dBm = RL - (600-MU)/6). RL?/LG? are read LIVE so
+        the map reflects the instrument's ACTUAL state, not our intended write. Returns (a, b), or None if
+        RL?/LG? are unreadable or LG <= 0 (linear amplitude mode -- no dB/div law)."""
+        try:
+            rl = _leading_float(self.t.query("RL?"))
+            lg = _leading_float(self.t.query("LG?"))
+        except Exception:                              # noqa: BLE001 -- unreadable -> no analytical map
+            return None
+        if lg <= 0:                                    # linear amplitude mode: the log dB/div law does not apply
+            return None
+        return (lg / 60.0, rl - 10.0 * lg)
+
+    def _verified_analytical_cal(self, mu, levels):
+        """The analytical map, VERIFIED before it is trusted: it must reproduce the paired ASCII levels
+        within _BIN_CAL_ANALYTIC_MAX_DB. On a FLAT trace this pins the OFFSET at the single MU value (the
+        slope is the known display law, not fitted), so a wrong/stale RL or scale fails and we stay ASCII.
+        Returns (a, b) or None (never a wrong amplitude)."""
+        ana = self._analytical_bin_cal()
+        if ana is None:
+            return None
+        a, b = ana
+        resid = max(abs(a * mu[i] + b - levels[i]) for i in range(len(levels)))
+        return (a, b) if resid <= self._BIN_CAL_ANALYTIC_MAX_DB else None
+
     def _read_and_calibrate(self, trace: str = "A") -> tuple:
         """FREEZE a sweep with SNGLS, then read the SAME held trace in ASCII (dBm) and binary (MU), fit
         dBm=a*MU+b, and cache (a,b) iff the RMS residual is tight. Restore ASCII + CONTS. Returns the
@@ -1394,7 +1428,9 @@ class Agilent856xEC(SpectrumAnalyzer):  # pragma: no cover - requires hardware
             if mu is not None and len(mu) == len(levels) and len(levels) >= 8:
                 cal = _fit_linear(mu, levels)
                 if cal is not None and cal[2] <= self._BIN_CAL_MAX_RMS_DB:
-                    self._bin_cal = (cal[0], cal[1])
+                    self._bin_cal = (cal[0], cal[1])       # empirical (trace has spread) -- self-correcting
+                else:                                      # G.4b: no spread (flat tone) / loose -> analytical
+                    self._bin_cal = self._verified_analytical_cal(mu, levels)
         finally:
             self.t.write("TDF P")
             self.t.write("CONTS")

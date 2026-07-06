@@ -26,6 +26,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config as cfg_mod
 import connection as conn
 import discover as disc
+import struct
+
 import drivers
 import loop
 import probe_sweep as ps
@@ -590,3 +592,50 @@ def test_68369_list_sweep_command_strings():
     # the wrong/unsupported mnemonics must NOT appear
     for bad in ("LSP", "SWP LST", "SWP ARM", "TRG EXT", "*TRG"):
         assert not any(bad in w for w in t.writes), bad
+
+
+# ================================================ G.4b analytical binary-cal fallback (flat tone)
+
+_TP = drivers.Agilent856xEC._TRACE_POINTS
+
+
+class _BinFakeTransport(FakeTransport):
+    """Serves BOTH a binary TDF-B trace (query_raw) and a matching ASCII trace (query TRA?) at a known
+    RL/LG, so _read_and_calibrate's G.4b analytical fallback can be exercised without hardware."""
+
+    def __init__(self, mu, level_dbm, rl=0.0, lg=10.0):
+        super().__init__({"ST?": "0.0", "RL?": f"{rl}", "LG?": f"{lg}", "DONE?": "1",
+                          "TRA?": ",".join([f"{level_dbm}"] * _TP)})
+        self._mu = int(mu)
+
+    def query_raw(self, cmd):
+        return struct.pack(f">{_TP}H", *([self._mu] * _TP))     # flat: every MU equal (a strong CW tone)
+
+
+def test_read_and_calibrate_flat_tone_uses_analytical_cal():
+    # G.4b: a narrow-span STRONG tone gives a FLAT trace (every MU equal) -> the empirical fit has no
+    # spread (_fit_linear returns None) and the old code stalled on the slow ASCII path. The analytical
+    # RL/LG log-law map, VERIFIED against the paired ASCII, now calibrates the binary path anyway.
+    # RL=0, LG=10 -> a=1/6, b=-100; a tone at MU=480 => 480/6 - 100 = -20 dBm (matches the served ASCII).
+    a = drivers.Agilent856xEC(_BinFakeTransport(mu=480, level_dbm=-20.0, rl=0.0, lg=10.0))
+    freqs, levels = a._read_and_calibrate("A")
+    assert len(levels) == _TP                                   # the ASCII deliverable is intact
+    assert a._bin_cal is not None                              # analytical fallback cached (not stuck on ASCII)
+    ca, cb = a._bin_cal
+    assert abs(ca - 1.0 / 6.0) < 1e-9 and abs(cb - (-100.0)) < 1e-9
+    assert abs(ca * 480 + cb - (-20.0)) < 1e-9                 # reproduces the tone level exactly
+
+
+def test_read_and_calibrate_flat_tone_rejects_wrong_rl():
+    # verify-before-cache: if the live RL? read does NOT match the served trace (a stale/mismatched
+    # display), the analytical map fails verification -> NO cache, stay on ASCII (never a wrong amplitude).
+    # RL=50 => a*480+b = 80-50 = +30 dBm, but the ASCII says -20 -> residual 50 dB > tol -> rejected.
+    a = drivers.Agilent856xEC(_BinFakeTransport(mu=480, level_dbm=-20.0, rl=50.0, lg=10.0))
+    a._read_and_calibrate("A")
+    assert a._bin_cal is None                                  # unverified analytical map -> ASCII fallback
+
+
+def test_analytical_bin_cal_none_in_linear_mode():
+    # LG <= 0 is linear amplitude mode: there is no dB/div log law, so no analytical map.
+    a = drivers.Agilent856xEC(_BinFakeTransport(mu=300, level_dbm=-20.0, rl=0.0, lg=0.0))
+    assert a._analytical_bin_cal() is None
