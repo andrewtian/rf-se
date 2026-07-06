@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/hero-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/hero-light.svg">
+    <img alt="se299 -- IEEE-299 substitution shielding-effectiveness automation, DC-40 GHz, SE >= 100 dB. Anritsu 68369A source + TX horn OUTSIDE, HP 8565EC analyzer + RX horn INSIDE; SE(f) = reference(f) - wall(f). A computer drives each instrument over GPIB: the outside controller, and the inside Pi reached over the fiber-optic link -- the only shield penetration, no copper through the shield. Every reading is logged over the digital bus, never read off the instrument display." src="assets/hero-light.svg" width="920">
+  </picture>
+</p>
+
 # se299 -- IEEE-299 substitution SE automation (Tier-1, real instruments)
 
 Computer-automated, no-cable shielding-effectiveness measurement for the HMEMC
