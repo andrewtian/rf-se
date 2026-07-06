@@ -958,6 +958,16 @@ class Agilent856xEC(SpectrumAnalyzer):  # pragma: no cover - requires hardware
         det = normalize_detector(detector)        # human label or mnemonic -> valid 8560 mnemonic
         self.t.write(f"DET {det}")
         self.t.write("SP 0HZ")                    # zero span: CW power vs time at CF
+        # ZERO-SPAN SWEEP TIME -- set a FIXED value, do NOT use ST AUTO. On this 8565EC (LIVE 2026-07-06)
+        # ST AUTO is unreliable (couples to 140 s at 30 kHz) AND does not revert a stuck MANUAL ST: a
+        # leftover "ST <n>" (a 2000 s state seen after a killed transfer) survives CONTS/CLRW/RB, so every
+        # measure_peak TS then waits that FULL time and the read HANGS (this stalled the whole coordinator
+        # path). A fixed ST scaled to the RBW filter settling (~30/RBW, floored 50 ms == the analyzer's own
+        # auto value at 1 kHz, capped 3 s) is deterministic + fast AND overwrites any stuck value. AUTO RBW
+        # (rbw_hz<=0) -> the 50 ms floor. The swept/PSD path sets its own ST (loop/set_sweep_time), so this
+        # zero-span value never leaks into a wide-span sweep.
+        st_s = 0.05 if not rbw_hz or rbw_hz <= 0 else min(3.0, max(0.05, 30.0 / rbw_hz))
+        self.t.write(f"ST {st_s * 1000:.0f}MS")
         if self.min_atten_db > 0:                 # SAFETY: enforce the input-attenuation floor so
             self.t.write(f"AT {self.min_atten_db:.0f}DB")   # BOTH read paths (tone + floor) are protected
         self._detector = det                      # remembered (as a mnemonic) so measure_floor restores it
@@ -1061,6 +1071,26 @@ class Agilent856xEC(SpectrumAnalyzer):  # pragma: no cover - requires hardware
             return False
         return sum(1 for i in range(n) if abs(a[i] - b[i]) > 0.05) > 3
 
+    def _sweep_completion_dwell_s(self) -> float:
+        """Seconds to dwell after a TS so the sweep COMPLETES before a marker/trace read. TS + DONE?
+        does NOT block for the new sweep over the qemu GPIB bridge (the same race arm_and_wait fixes
+        for the trace path), so a marker read taken before this dwell lands on the PRIOR sweep or -- after
+        a configure() CLRW -- on the BLANK bottom graticule. That blank is constant, so the stabilize
+        loops in measure_peak/measure_tracked_peak "settle" on it immediately and return the floor as
+        the reading: the LIVE root cause of the false noise floor / false NO-COUPLING / false wedge
+        (bench 8565EC, 2026-07-06: a no-dwell read reported 0 dB coupling where a dwelled read recovered
+        +21..24 dB). >= the auto-coupled sweep time (ST?), floored at _ARM_DWELL_S. Computed once per
+        read call (one ST? round-trip) and reused across the stabilize loop."""
+        try:
+            sweep_s = max(0.0, float(self.t.query("ST?")))     # actual (auto-coupled) sweep time
+        except Exception:                                      # noqa: BLE001 -- ST? unreadable -> floor
+            sweep_s = 0.0
+        # CAP at 5 s: a stuck/absurd ST (a wedged 2000 s state, or zero-span auto-coupling to ~140 s at
+        # some RBW) must not turn the dwell into a multi-hundred-second SLEEP. 5 s >> any legitimate SE
+        # zero-span sweep (1 kHz ~= 50 ms); configure() sets a fixed RBW-scaled ST to keep it sane, and
+        # this bounds our own sleep if it is not (the stabilize loop + health gate remain the backstops).
+        return min(max(self._ARM_DWELL_S, sweep_s * 1.5), 5.0)  # dwell >= sweep time = completion guarantee
+
     def measure_peak(self, f_hz: float, settle_s: float) -> tuple:
         self.t.write(f"CF {f_hz:.0f}HZ")
         # GENTLE OPERATION (Task 3): a real dwell after the retune lets the first LO settle BEFORE the
@@ -1085,10 +1115,17 @@ class Agilent856xEC(SpectrumAnalyzer):  # pragma: no cover - requires hardware
         # loop keeps going until it is stable) -- one mechanism for both the bridge lag and the RF
         # settle. A genuinely wedged analyzer returns a CONSTANT stuck value (consecutive reads agree
         # immediately); callers detect that as tone == floor (no coupling) rather than a false pass.
-        self.t.write("TS"); self.t.query("DONE?")
+        # COMPLETION DWELL (the same race arm_and_wait fixes for the trace path): TS + DONE? does NOT
+        # block for the new sweep over the qemu GPIB bridge, so read the marker only AFTER a dwell >= the
+        # sweep time. Without it a configure()-CLRW-cleared trace reads the BLANK bottom graticule, and
+        # the stabilize loop below "settles" on that constant blank (every read agrees) -- the LIVE root
+        # cause of the false floor / false NO-COUPLING / false wedge. One ST? query, reused across the loop.
+        self.t.write("CONTS")                     # continuous sweep (bridge-reliable; see arm_and_wait)
+        dwell = self._sweep_completion_dwell_s()
+        self.t.write("TS"); self.t.query("DONE?"); time.sleep(dwell)   # flush stale one-behind + COMPLETE
         self.t.write("MKPK HI"); prev = float(self.t.query("MKA?"))
         for _ in range(self._READ_STABLE_TRIES):
-            self.t.write("TS"); self.t.query("DONE?")     # next fresh sweep
+            self.t.write("TS"); self.t.query("DONE?"); time.sleep(dwell)   # next COMPLETED sweep
             self.t.write("MKPK HI")
             cur = float(self.t.query("MKA?"))
             if abs(cur - prev) <= self._READ_STABLE_TOL_DB:
@@ -1141,11 +1178,14 @@ class Agilent856xEC(SpectrumAnalyzer):  # pragma: no cover - requires hardware
             time.sleep(settle_s)
         # NB: no per-read liveness guard here -- a strong stable tone reads as a near-constant trace,
         # indistinguishable from frozen. Wedge detection is the HEALTH GATE's job, on the floor (RF off).
-        # stabilize-read the peak (two consecutive marker reads agree -> defeats the bridge stale-lag)
-        self.t.write("TS"); self.t.query("DONE?")
+        # stabilize-read the peak (two consecutive marker reads agree -> defeats the bridge stale-lag),
+        # each after a COMPLETION DWELL (see measure_peak / _sweep_completion_dwell_s: DONE? does not
+        # block over the bridge, so a read before the sweep completes lands on the prior/blank trace).
+        dwell = self._sweep_completion_dwell_s()
+        self.t.write("TS"); self.t.query("DONE?"); time.sleep(dwell)
         self.t.write("MKPK HI"); prev = float(self.t.query("MKA?"))
         for _ in range(self._READ_STABLE_TRIES):
-            self.t.write("TS"); self.t.query("DONE?")
+            self.t.write("TS"); self.t.query("DONE?"); time.sleep(dwell)
             self.t.write("MKPK HI")
             cur = float(self.t.query("MKA?"))
             if abs(cur - prev) <= self._READ_STABLE_TOL_DB:
@@ -1184,6 +1224,9 @@ class Agilent856xEC(SpectrumAnalyzer):  # pragma: no cover - requires hardware
         self.t.write(f"SP {span_hz:.0f}HZ")
         self.t.write(f"RB {max(rbw_hz, 1e3):.0f}HZ")   # PP unavailable at RBW <= 100 Hz
         self.t.write("TS"); self.t.query("DONE?")
+        time.sleep(self._sweep_completion_dwell_s())   # COMPLETE the sweep before the tone-guard read
+        #                                                (else a CLRW-blank trace reads "no tone" -> the
+        #                                                YIG is left un-peaked and a real tone reads low)
         # REAL-TONE GUARD: PP (peak preselector) tunes the YIG onto whatever MKPK HI lands on. If NO
         # tone is present (source not settled / not emitting / path open), MKPK locks a noise bin and PP
         # mis-tunes the YIG to REJECT that frequency -> the display goes BLANK and stays blank until the
@@ -1227,6 +1270,7 @@ class Agilent856xEC(SpectrumAnalyzer):  # pragma: no cover - requires hardware
         if sweeps and sweeps > 1:
             self.t.write(f"VAVG {int(sweeps)}")
         self.t.write("TS"); self.t.query("DONE?")
+        time.sleep(self._sweep_completion_dwell_s())   # COMPLETE the sweep before the trace read
         self.t.write("TDF P")
         raw = self.t.query("TRA?")
         vals = [float(x) for x in raw.replace(";", ",").split(",") if x.strip()]

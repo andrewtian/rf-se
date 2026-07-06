@@ -237,7 +237,8 @@ def test_preselector_peak_noop_below_2p9ghz():
 
 def test_preselector_peak_sequence_above_2p9ghz():
     t = FakeT({"PSDAC?": "131", "TRA?": _TONE_TRACE})   # a real tone is present -> PP proceeds
-    dac = drivers.Agilent856xEC(t).peak_preselector(6e9)
+    ana = drivers.Agilent856xEC(t); ana._ARM_DWELL_S = 0
+    dac = ana.peak_preselector(6e9)
     assert dac == 131
     # PP requires a nonzero high-band span + RBW>100Hz, mark the tone to center, then PP
     assert any(w.startswith("SP ") and w != "SP 0HZ" for w in t.writes)
@@ -251,7 +252,8 @@ def test_preselector_peak_skips_when_no_tone_present():
     # (LIVE bug: peaking before the source settled blanked the read). It leaves CF + the preselector
     # UNTOUCHED and returns None, so the caller reads the (absent/low) tone -- never a self-inflicted blank.
     t = FakeT({"PSDAC?": "131"})                             # FakeT default trace = flat noise, no tone
-    dac = drivers.Agilent856xEC(t).peak_preselector(6e9)
+    ana = drivers.Agilent856xEC(t); ana._ARM_DWELL_S = 0
+    dac = ana.peak_preselector(6e9)
     assert dac is None
     assert "PP" not in t.writes and "MKCF" not in t.writes   # YIG + center left untouched
 
@@ -268,7 +270,8 @@ def test_measure_peak_no_longer_queries_marker_freq():
     # MINOR-6: MKF? is a wasted read -- every caller discards the first element (_, amp).
     # measure_peak now returns the COMMANDED frequency directly, with no MKF? round-trip.
     t = FakeT({"MKA?": "-42.5"})
-    f_hz, amp = drivers.Agilent856xEC(t).measure_peak(6e9, 0.0)
+    ana = drivers.Agilent856xEC(t); ana._ARM_DWELL_S = 0   # deterministic FakeT -> no real completion sleep
+    f_hz, amp = ana.measure_peak(6e9, 0.0)
     assert f_hz == 6e9 and amp == -42.5
     assert "MKF?" not in t.queries
 
@@ -283,6 +286,7 @@ def test_measure_peak_returns_marker_when_sweep_is_live():
     t = FakeT({"MKA?": "-42.5"})
     ana = drivers.Agilent856xEC(t)
     ana._SWEEP_LIVE_DWELL_S = 0.0                      # FakeT is deterministic (no bridge race) -> no dwell
+    ana._ARM_DWELL_S = 0                               # ...and no completion-dwell sleep in the read path
     assert ana._sweep_is_live() is True
     f_hz, amp = ana.measure_peak(2e9, 0.0)
     assert f_hz == 2e9 and amp == -42.5
@@ -315,9 +319,39 @@ def test_require_live_sweep_raises_on_frozen_floor_only():
     # measure_peak itself does NOT raise on a frozen fixture (guard removed) -- it returns the marker;
     # wedge detection is the floor health gate's job, not the per-read's.
     tp = FakeT({"TRA?": frozen, "MKA?": "-42.5"})
-    ap = drivers.Agilent856xEC(tp); ap._SWEEP_LIVE_DWELL_S = 0.0
+    ap = drivers.Agilent856xEC(tp); ap._SWEEP_LIVE_DWELL_S = 0.0; ap._ARM_DWELL_S = 0
     f_hz, amp = ap.measure_peak(2e9, 0.0)
     assert f_hz == 2e9 and amp == -42.5
+
+
+def test_measure_peak_dwells_for_sweep_completion(monkeypatch):
+    # THE 2026-07-06 FIX: measure_peak must DWELL after each TS so the sweep COMPLETES over the qemu GPIB
+    # bridge before the marker read. Without it a configure()-CLRW-cleared trace reads the BLANK bottom
+    # graticule and the stabilize loop "settles" on that constant blank -- the LIVE root cause of the
+    # false floor / false NO-COUPLING (a no-dwell read reported 0 dB coupling where a dwelled read
+    # recovered +21..24 dB on the bench 8565EC). Assert the completion dwell (>= _ARM_DWELL_S), sized off
+    # the auto-coupled sweep time ST?, is issued after a continuous-sweep TS.
+    slept = []
+    monkeypatch.setattr(drivers.time, "sleep", lambda s: slept.append(s))
+    t = FakeT({"MKA?": "-42.5", "ST?": "0.05"})           # 50 ms sweep -> dwell = max(0.12, 0.075) = 0.12
+    ana = drivers.Agilent856xEC(t)
+    f_hz, amp = ana.measure_peak(2e9, 0.0)
+    assert f_hz == 2e9 and amp == -42.5
+    assert any(q == "ST?" for q in t.queries)             # queried the sweep time to size the dwell
+    assert "CONTS" in t.writes                            # bridge-reliable continuous sweep
+    assert slept and max(slept) >= ana._ARM_DWELL_S       # dwelled >= the completion floor
+
+
+def test_sweep_completion_dwell_tracks_sweep_time():
+    # dwell >= the auto-coupled sweep time (1.5x margin), floored at _ARM_DWELL_S; unreadable ST? -> floor.
+    ana_slow = drivers.Agilent856xEC(FakeT({"ST?": "0.40"}))    # 400 ms sweep -> 0.40 * 1.5 = 0.60 s
+    assert abs(ana_slow._sweep_completion_dwell_s() - 0.60) < 1e-6
+    ana_fast = drivers.Agilent856xEC(FakeT({"ST?": "0.01"}))    # 10 ms -> 0.015 < floor -> _ARM_DWELL_S
+    assert ana_fast._sweep_completion_dwell_s() == ana_fast._ARM_DWELL_S
+    ana_bad = drivers.Agilent856xEC(FakeT({"ST?": "garbage"}))  # unreadable ST? -> floor, never crash
+    assert ana_bad._sweep_completion_dwell_s() == ana_bad._ARM_DWELL_S
+    ana_stuck = drivers.Agilent856xEC(FakeT({"ST?": "2000"}))   # LIVE pathology: a stuck 2000 s sweep time
+    assert ana_stuck._sweep_completion_dwell_s() == 5.0         # -> CAPPED at 5 s, never a 3000 s sleep
 
 
 # --- Task 3: single-consumer enforcement. lease_exclusive() must acquire an exclusive device lease,
@@ -404,7 +438,8 @@ def test_measure_tracked_peak_real_searches_and_preselector_peaks_high_band():
     # peak) instead of a bare zero-span-at-exact-CF read. Below 2.9 GHz it sets a nonzero search span;
     # above 2.9 GHz it invokes the preselector peak (PP). Verify the command path per band.
     t = FakeT({"MKA?": "-12.0", "MKF?": "2000000000"})
-    f, amp = drivers.Agilent856xEC(t).measure_tracked_peak(2.0e9)     # band 0
+    ana = drivers.Agilent856xEC(t); ana._ARM_DWELL_S = 0
+    f, amp = ana.measure_tracked_peak(2.0e9)     # band 0
     assert amp == -12.0 and abs(f - 2.0e9) < 1
     assert any(w.startswith("SP ") and w != "SP 0HZ" for w in t.writes)   # a NONZERO search span
     assert "PP" not in t.writes                                        # no preselector below 2.9 GHz
@@ -488,7 +523,7 @@ def test_measure_floor_uses_sample_detector_and_restores_configured():
     # P1-4: the source-off floor MUST be read with DET SMP (POS inflates it ~+2.5 dB), then the
     # CONFIGURED detector (not hardcoded POS) must be restored for the tone read that follows.
     t = FakeT({"MKA?": "-95.0"})
-    a = drivers.Agilent856xEC(t)
+    a = drivers.Agilent856xEC(t); a._ARM_DWELL_S = 0
     a.configure(1e3, 3e3, -10.0, "NRM")                   # a non-default configured detector
     t.writes.clear()                                      # isolate measure_floor's own writes
     f_hz, floor = a.measure_floor(6e9, 0.0)
@@ -515,7 +550,8 @@ def test_measure_average_uses_sample_detector_and_linear_mean():
     # a masker-robust read: SAMPLE detector + linear-power average of the trace
     trace = ",".join(["-100"] * 600 + ["-40"])           # 600 floor pts + 1 tone-ish pt
     t = FakeT({"TRA?": trace})
-    _, avg = drivers.Agilent856xEC(t).measure_average(2e9, 0.1, sweeps=8)
+    ana = drivers.Agilent856xEC(t); ana._ARM_DWELL_S = 0
+    _, avg = ana.measure_average(2e9, 0.1, sweeps=8)
     assert "DET SMP" in t.writes and "VAVG 8" in t.writes
     lin = (600 * 10 ** (-100 / 10) + 10 ** (-40 / 10)) / 601
     assert abs(avg - 10 * math.log10(lin)) < 1e-6
