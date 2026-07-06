@@ -207,6 +207,69 @@ def test_adapter_wedged_verdict_faults_immediately():
     assert "ADAPTER_WEDGED" in link.reason
 
 
+# ---- 44.2 soft-recover hook at the FAULT threshold (opt-in; default None = prior behavior) ----
+
+def test_soft_recover_hook_averts_fault_on_success():
+    # at the FAULT threshold, a recover_fn that reports a successful QMP virtual-replug must AVERT the
+    # terminal FAULT: the streak clears and the link drops to DISCONNECTED (revalidate next ensure).
+    calls = {"n": 0}
+
+    def recover(exc):
+        calls["n"] += 1
+        return True                                  # a successful soft recovery
+
+    link = conn.SourceLink(expected=conn.DEFAULT_68369A, span=(1e9, 6e9),
+                           discover_fn=lambda: [], open_fn=lambda d: None,
+                           retries=5, backoff_s=0.0, fault_after=1, recover_fn=recover)
+    link._bump_failure(IOError("boom"))              # fault_after=1 -> would FAULT; recovery averts it
+    assert calls["n"] == 1                            # recovery attempted at the threshold
+    assert link.state == conn.DISCONNECTED           # averted -> revalidate, NOT terminal FAULT
+    assert "soft-recovered" in link.reason.lower()
+    assert link._consec_fail == 0                     # the failure streak was cleared
+
+
+def test_soft_recover_hook_falls_through_to_fault_on_failure():
+    # a recover_fn that reports FAILURE (a HARD FX2 wedge a QMP reset cannot clear) must fall through to
+    # the terminal FAULT with the actionable physical-replug message (44.3).
+    dev = _dev()
+
+    def open_always_fails(d):
+        raise IOError("gpib bridge ENOL: no listeners currently addressed")
+
+    link = conn.SourceLink(expected=conn.DEFAULT_68369A, span=(1e9, 6e9),
+                           discover_fn=lambda: [dev], open_fn=open_always_fails,
+                           retries=5, backoff_s=0.0, fault_after=3,
+                           recover_fn=lambda exc: False)
+    assert link.ensure() is False
+    assert link.state == conn.FAULT
+    assert "power-cycle" in link.reason.lower()      # HARD: physical remedy, not a silent spin
+
+
+def test_soft_recover_is_not_reentrant():
+    # a bus op that faults INSIDE recover_fn must NOT recurse into recovery (the _recovering guard).
+    dev = _dev()
+
+    def open_always_fails(d):
+        raise IOError("ENOL")
+
+    depth = {"cur": 0, "max": 0}
+    link = conn.SourceLink(expected=conn.DEFAULT_68369A, span=(1e9, 6e9),
+                           discover_fn=lambda: [dev], open_fn=open_always_fails,
+                           retries=2, backoff_s=0.0, fault_after=1)
+
+    def recover(exc):
+        depth["cur"] += 1
+        depth["max"] = max(depth["max"], depth["cur"])
+        link._on_drop(IOError("a bus op inside recovery"))   # re-enters _bump_failure; must NOT recurse
+        depth["cur"] -= 1
+        return False
+
+    link._recover_fn = recover
+    link.ensure()
+    assert depth["max"] == 1                          # recovery never re-entered itself
+    assert link.state == conn.FAULT                  # inner fault + failed recovery -> terminal
+
+
 def test_absent_device_is_not_a_fault():
     # ABSENT (nothing on the bus) must stay ABSENT, never escalate to FAULT -- distinct condition.
     link = conn.SourceLink(expected=conn.DEFAULT_68369A, span=(1e9, 6e9),

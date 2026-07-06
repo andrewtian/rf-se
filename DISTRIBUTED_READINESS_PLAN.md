@@ -174,3 +174,28 @@ Status key: [x] done + committed, [~] in flight, [ ] queued.
   distributed-arch: UNSOUND today, core sound). Live function check attempted -> singleton bridge
   failed to provision (section-4 two-board gpib.conf). ControlLease steal-guard fixed + committed
   (3f9d9aee, board 487). Wave 1 correction ensemble launched (wcgnd6c6u).
+
+- 2026-07-06 (#44 auto-recover on unplug/replug): the recovery MACHINERY is implemented + hardware-free
+  tested; the definitive live proof is bench-gated.
+  DONE (hardware-free, tested):
+    * 44.1 lease_diagnostics.classify_recovery -- pure recovery-tier decision table
+      (SETTLING / PRE_FIRMWARE / BOOTING_GRACE / ANSWERING / INSTRUMENT_SILENT + soft_recoverable +
+      shared_controller warning). BOOTING_GRACE guards the R6 false positive EVEN past the attempt
+      budget; INSTRUMENT_SILENT is SOFT while attempts remain, HARD once spent. (17 tests)
+    * 44.2 recovery.soft_recover -- de-key-source-FIRST, budgeted QMP virtual-replug + revalidate; all
+      I/O injected. Activation seam connection.AnalyzerLink(recover_fn=...): at the FAULT threshold a
+      wired local-qemu recover_fn averts terminal FAULT on success, else falls through to FAULT.
+      Default None = prior behavior; a remote net: owner gets no hook (HARD-alert only). (test_recovery
+      + test_client_reliability, board green)
+    * 44.3 recovery.recover_power -- HONEST deferred VBUS seam: never claims success (no uhubctl
+      per-port-power hub procured); the HARD alert names the physical-replug remedy. The link stays
+      terminal FAULT on a failed recovery.
+  BENCH-GATED (needs the physical adapter -- run_live_replug_recovery.py, 44.4):
+    * the ONE remaining production integration: thread the local VmSpec from cli._ensure_vm_addresses
+      down through control_plane into the owner's recover_fn (a LOCAL --vm owner only). Deliberately
+      done + validated on the bench, because right-spec/role/de-key can only be confirmed with the real
+      qemu + adapter present.
+    * the definitive SOFT-vs-HARD proof: a CLEAN replug SOFT-recovers via QMP; a load-induced FX2 -110
+      wedge does NOT and must land in the HARD alert -- only a physical unplug/replug tells them apart.
+      A fake QMP backend cannot reproduce real FX2 re-enumeration. Requires both NI adapters on SEPARATE
+      USB controllers (a bring-up on a SHARED controller wedges both).

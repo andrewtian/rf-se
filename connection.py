@@ -89,7 +89,7 @@ class AnalyzerLink:
     role = "rx"                             # this side's role (rx analyzer); SourceLink overrides tx
 
     def __init__(self, expected: ExpectedAnalyzer, span, discover_fn, open_fn,
-                 retries: int = 3, backoff_s: float = 0.25, fault_after: int = 3):
+                 retries: int = 3, backoff_s: float = 0.25, fault_after: int = 3, recover_fn=None):
         self.expected = expected
         self.span = tuple(span)
         self._discover = discover_fn        # () -> list[DiscoveredDevice]
@@ -110,6 +110,13 @@ class AnalyzerLink:
         # fault_after in a row (or an ADAPTER_WEDGED verdict) the link goes terminal FAULT.
         self._consec_fail = 0
         self.fault_after = max(1, int(fault_after))
+        # 44.2 SOFT RECOVER (opt-in): a closure recover_fn(exc) -> bool that de-keys the source and QMP
+        # virtual-replugs this adapter up to its budget, returning True iff the instrument answered again.
+        # Injected ONLY for a LOCAL --vm owner (a remote net: address gets None -> straight to FAULT /
+        # 44.3 HARD alert). Default None = the exact prior behavior. _recovering guards re-entrancy so a
+        # bus op inside recover_fn cannot recurse into recovery.
+        self._recover_fn = recover_fn
+        self._recovering = False
 
     # -- lifecycle --------------------------------------------------------
 
@@ -256,9 +263,29 @@ class AnalyzerLink:
         verdict immediately, or after fault_after consecutive failures. A FAULT carries an
         actionable message and overrides the just-set intermediate (DISCONNECTED/FAILED) state."""
         self._consec_fail += 1
-        if getattr(exc, "adapter_wedged", False) or self._consec_fail >= self.fault_after:
-            self.state = FAULT
-            self.reason = self._fault_message(self._consec_fail, exc)
+        if not (getattr(exc, "adapter_wedged", False) or self._consec_fail >= self.fault_after):
+            return
+        # About to declare terminal FAULT. 44.2: if a local-qemu soft-recover hook is wired, attempt ONE
+        # supervised recovery first (it de-keys the source, then QMP virtual-replugs up to its budget and
+        # revalidates). On success, clear the failure streak and drop to DISCONNECTED so the next ensure()
+        # reconnects (counted as a reconnect); on failure -> terminal FAULT (44.3 HARD alert). _recovering
+        # blocks re-entrancy so a bus op inside recover_fn cannot recurse.
+        if self._recover_fn is not None and not self._recovering:
+            self._recovering = True
+            try:
+                recovered = bool(self._recover_fn(exc))
+            except Exception:                             # noqa: BLE001 -- a failed recovery -> FAULT
+                recovered = False
+            finally:
+                self._recovering = False
+            if recovered:
+                self._consec_fail = 0
+                self._dropped = True                      # the next READY counts as a reconnect
+                self.state = DISCONNECTED
+                self.reason = "soft-recovered (QMP virtual-replug) -- revalidating"
+                return
+        self.state = FAULT
+        self.reason = self._fault_message(self._consec_fail, exc)
 
     def _fault_message(self, tries, exc=None) -> str:
         """Actionable FAULT reason: which role/model/pad stopped answering, and what to do."""
