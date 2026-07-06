@@ -110,3 +110,74 @@ def test_measure_wall_rejects_tx_power_mismatch_vs_calibration():
     with pytest.raises(loop.AcquisitionRejected) as ei:
         cp_wall.make_coordinator().measure_wall(ref, bench=cp_wall.bench)
     assert "TX power" in str(ei.value)                       # names the mismatch, not an opaque abort
+
+
+# ---- G.4 ambient bracket: the 0 dB reference must fall BACK to the floor when our tone stops ----
+
+class _FakeSrc:                                              # a minimal duck-typed source (no radiate)
+    def prepare(self): pass
+    def set_power(self, p): pass
+    def set_freq(self, f): pass
+    def rf_on(self): pass
+    def rf_off(self): pass
+    def await_settled(self, s, opc): pass
+
+
+class _AmbientAnalyzer:
+    """measure_floor call #1 = off1 (source-off floor), call #2 = off2 (the trailing ambient probe);
+    measure_peak = the source-ON reference. Scriptable to model a PERSISTENT external tone (off2
+    elevated) vs a clean bench (off2 == off1). One point + a target that clears at the first rung, so
+    the ladder never narrows -> measure_floor is called exactly twice."""
+    def __init__(self, off1, off2, ref):
+        self._floors, self._i, self._ref = [off1, off2], 0, ref
+    def prepare(self): pass
+    def configure(self, *a): pass
+    def measure_floor(self, f, s):
+        v = self._floors[min(self._i, len(self._floors) - 1)]
+        self._i += 1
+        return (f, v)
+    def measure_peak(self, f, s):
+        return (f, self._ref)
+
+
+def _g4_cfg():
+    import config
+    # one point at 1 GHz; target_se_db=10 so cap clears the first rung and the RBW ladder never narrows
+    return config.Campaign(
+        bands=(config.BandPlan("t", 1e9, 2e9, 1, 14.0, 10.0, -150.0, target_se_db=10.0),), label="g4")
+
+
+def test_acquire_reference_clean_reference_is_reversible():
+    # off2 == off1 (clean bench): our tone drove the ON read and vanished when RF went off -> ref
+    # clears max(off1, off2) by the guard -> reversible, additive keys present, SE path unchanged.
+    cfg = _g4_cfg()
+    rows = loop.acquire_reference(cfg, _FakeSrc(), _AmbientAnalyzer(off1=-100.0, off2=-100.0, ref=-30.0))
+    r = rows[0]
+    assert r["ref_reversible"] is True
+    assert r["ref_off2_dbm"] == -100.0 and r["ambient_dbm"] == -100.0
+    assert r["floor_dbm"] == -100.0 and r["ref_dbm"] == -30.0      # off1/ON reads unchanged
+
+
+def test_acquire_reference_flags_irreversible_ambient():
+    # a PERSISTENT external tone: it inflates the ON read (ref) AND is still there at off2, so ref does
+    # NOT clear max(off1, off2) by the 6 dB guard -> flagged NOT reversible so summarize can gate it,
+    # rather than letting ambient masquerade as coupling and be trusted as real capability.
+    cfg = _g4_cfg()
+    rows = loop.acquire_reference(cfg, _FakeSrc(), _AmbientAnalyzer(off1=-100.0, off2=-33.0, ref=-30.0))
+    r = rows[0]
+    assert r["ref_reversible"] is False                           # -30 < max(-100,-33) + 6 = -27
+    assert r["ambient_dbm"] == -33.0 and r["ref_off2_dbm"] == -33.0
+    assert r["floor_dbm"] == -100.0                               # off1 (clean) still the recorded floor
+
+
+def test_sim_reference_rows_carry_reversible_keys():
+    # the real sim (clean bench: source tone reverses cleanly) -> every reference row is reversible and
+    # carries the additive keys; guards the "reversible case leaves SE unchanged" claim on the sim.
+    import config
+    import control_plane
+    cp = control_plane.simulated(config.Campaign(
+        bands=(config.BandPlan("t", 1e9, 2e9, 2, 14.0, 12.0, -150.0, target_se_db=80.0),), label="g4sim"))
+    rows = cp.make_coordinator().acquire_reference(bench=cp.bench)
+    for r in rows.values():
+        assert r["ref_reversible"] is True
+        assert "ref_off2_dbm" in r and "ambient_dbm" in r

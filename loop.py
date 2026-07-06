@@ -88,7 +88,7 @@ def _configure_analyzer(analyzer, cfg, rbw_hz):
             "detector": a.detector, "attenuation_db": a.attenuation_db}
 
 
-def acquire_reference(cfg, source, analyzer, bench=None, on_point=None):
+def acquire_reference(cfg, source, analyzer, bench=None, on_point=None, ambient_guard_db=6.0):
     """EA8 empty-frame pass (horns face-to-face, NO wall).
 
     Per f: measure the noise floor (RF off) and the 0 dB reference (RF on) at the FIRST rung of
@@ -176,6 +176,19 @@ def acquire_reference(cfg, source, analyzer, bench=None, on_point=None):
             finally:
                 source.rf_off()
             cap = ref - floor - cfg.margin_db
+        # G.4 AMBIENT BRACKET (after the ladder; source OFF from the final rf_off): a genuine 0 dB
+        # reference must fall BACK to the floor when our tone stops. Take a trailing source-off read
+        # (off2) and test REVERSIBILITY -- a persistent EXTERNAL tone inflates BOTH the ON ref and
+        # off2, so ref will not clear max(off1, off2) by the guard; flag it rather than let ambient
+        # masquerade as coupling and inflate SE. off1 = the final rung's `floor`. SAFETY: the source is
+        # already OFF here, so a raised off2 cannot leave it keyed; a FAILED off2 defaults to reversible
+        # so the normal path stays byte-identical. ONE read per point (not per rung).
+        try:
+            _, ref_off2 = analyzer.measure_floor(f_hz, cfg.analyzer.settle_s)
+        except Exception:                                  # noqa: BLE001 -- ambient probe is advisory
+            ref_off2 = None
+        ambient = floor if ref_off2 is None else max(floor, ref_off2)
+        ref_reversible = bool(ref >= ambient + ambient_guard_db)
         rows[i] = {
             "band": band.name, "f_hz": f_hz,
             "src_power_dbm": band.source_power_dbm,  # KNOWN TX: calibrated source-output power
@@ -190,6 +203,8 @@ def acquire_reference(cfg, source, analyzer, bench=None, on_point=None):
             "acq_mode": "stepped-cw-zerospan", "purpose": "acceptance",
             "source_tracked": True,          # the source is set to f at every point
             "band_trust": _band_trust(f_hz),  # Task 4: 'trusted' <=2.9GHz / 'provisional' above
+            # G.4 ambient bracket (ADDITIVE; ref_reversible=True in the normal case -> SE unchanged):
+            "ref_off2_dbm": ref_off2, "ambient_dbm": ambient, "ref_reversible": ref_reversible,
         }
         if on_point is not None:
             on_point(i, rows[i])
